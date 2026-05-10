@@ -210,12 +210,13 @@ def process_chat(messages: list[Message]) -> ChatResponse:
     """Process a chat request and return the agent's response.
     
     This is the main entry point for each /chat call. It:
-    1. Counts turns and calculates remaining budget
-    2. Extracts a search query from the conversation history
-    3. Retrieves relevant catalog items via FAISS
-    4. Builds a turn-aware prompt with retrieved context
-    5. Calls the LLM
-    6. Validates and returns the response
+    1. Detects and handles edge cases (injection, post-EOC, turn overflow)
+    2. Counts turns and calculates remaining budget
+    3. Extracts a search query from the conversation history
+    4. Retrieves relevant catalog items via FAISS
+    5. Builds a turn-aware prompt with retrieved context
+    6. Calls the LLM
+    7. Validates and returns the response
     
     Args:
         messages: Full conversation history as Message objects.
@@ -230,15 +231,37 @@ def process_chat(messages: list[Message]) -> ChatResponse:
     # Convert messages to dicts
     msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
     
-    # Step 0: Calculate turn budget
-    # Total messages so far + 1 (this response) = total turns used
-    current_turn_count = len(msg_dicts)  # messages received
-    turns_after_response = current_turn_count + 1  # after we respond
-    turns_remaining = MAX_TURNS - turns_after_response
-    logger.info(f"Turn budget: {current_turn_count} messages received, {turns_remaining} turns remaining after response")
+    # Step 0a: Detect post-EOC restart
+    # If a prior assistant message contained end_of_conversation: true,
+    # treat everything after it as a fresh conversation for retrieval context
+    eoc_index = _find_last_eoc_index(msg_dicts)
+    if eoc_index is not None and eoc_index < len(msg_dicts) - 1:
+        # There are messages after the EOC — treat as a restart
+        logger.info(f"Post-EOC restart detected at index {eoc_index}, using messages from {eoc_index+1} onwards for context")
+        # Use only messages after EOC for query building, but keep full history for the prompt
+        restart_msgs = msg_dicts[eoc_index + 1:]
+    else:
+        restart_msgs = None  # No restart
+    
+    # Step 0b: Handle turn-cap overflow
+    # If conversation already has 8+ messages, truncate to last 7 for context
+    # (keeps the most relevant recent turns while respecting budget)
+    if len(msg_dicts) >= MAX_TURNS:
+        logger.warning(f"Turn cap overflow: {len(msg_dicts)} messages received (max {MAX_TURNS})")
+        # Keep last 7 messages to leave room for our response
+        msg_dicts = msg_dicts[-(MAX_TURNS - 1):]
+        turns_remaining = 0  # Force immediate recommendation + EOC
+    else:
+        # Normal turn budget calculation
+        current_turn_count = len(msg_dicts)
+        turns_after_response = current_turn_count + 1
+        turns_remaining = MAX_TURNS - turns_after_response
+    
+    logger.info(f"Turn budget: {len(msg_dicts)} messages in context, {turns_remaining} turns remaining after response")
     
     # Step 1: Extract search query from conversation
-    query = build_query_from_messages(msg_dicts)
+    query_msgs = restart_msgs if restart_msgs else msg_dicts
+    query = build_query_from_messages(query_msgs)
     logger.info(f"Search query: {query[:200]}")
     
     # Step 2: Retrieve relevant catalog items
@@ -331,3 +354,31 @@ def _extract_mentioned_items(text: str, catalog: CatalogStore) -> list[dict]:
                 seen_urls.add(item["url"])
     
     return mentioned
+
+
+def _find_last_eoc_index(messages: list[dict]) -> Optional[int]:
+    """Find the index of the last assistant message that signaled end_of_conversation.
+    
+    Looks for end_of_conversation: true in assistant message content (JSON).
+    
+    Args:
+        messages: List of message dicts.
+        
+    Returns:
+        Index of the last EOC message, or None if not found.
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg["role"] == "assistant":
+            content = msg["content"]
+            # Check for JSON with end_of_conversation: true
+            if "end_of_conversation" in content:
+                try:
+                    data = json.loads(content)
+                    if data.get("end_of_conversation"):
+                        return i
+                except (json.JSONDecodeError, AttributeError):
+                    # Also check for string pattern
+                    if '"end_of_conversation": true' in content or '"end_of_conversation":true' in content:
+                        return i
+    return None
