@@ -1,0 +1,282 @@
+# SHL Conversational Assessment Recommender — Implementation Plan v2
+
+## 🎯 Objective
+Build a conversational agent that helps hiring managers discover SHL Individual Test Solutions through natural dialogue. The agent clarifies vague queries, recommends 1–10 assessments with catalog URLs, supports mid-conversation refinement, compares assessments — all grounded strictly in the provided catalog data.
+
+---
+
+## 📊 Data Summary (What We Have)
+
+### Catalog: `dataset.txt`
+- **377 Individual Test Solutions** (pre-scraped, no scraping needed!)
+- **Fields per item**: `entity_id`, `name`, `link`, `job_levels`, `languages`, `duration`, `remote`, `adaptive`, `description`, `keys` (test types)
+- **Test type distribution**:
+  | Key | Count | Letter Code |
+  |-----|-------|-------------|
+  | Knowledge & Skills | 240 | K |
+  | Personality & Behavior | 67 | P |
+  | Simulations | 43 | S |
+  | Ability & Aptitude | 32 | A |
+  | Competencies | 19 | C |
+  | Biodata & Situational Judgment | 17 | B |
+  | Development & 360 | 7 | D |
+  | Assessment Exercises | 2 | E |
+- **Job levels**: Director, Entry-Level, Executive, Front Line Manager, General Population, Graduate, Manager, Mid-Professional, Professional Individual Contributor, Supervisor
+
+### Sample Conversations: C1–C10 (10 traces)
+Key patterns observed from reading all 10 conversations:
+
+| ID | Scenario | Turns | Key Behaviors | Final Rec Count |
+|----|----------|-------|---------------|----------------|
+| C1 | Senior leadership selection | 4 | Clarify → Recommend → Confirm | 3 |
+| C2 | Senior Rust engineer | 3 | Handle missing tech → Suggest alternatives + cognitive | 5 |
+| C3 | 500 entry-level contact centre | 5 | Clarify language → Recommend → Compare → Confirm | 4 |
+| C4 | Graduate financial analysts | 3 | Recommend fast (specific query) → Refine (add SJT) → Confirm | 5 |
+| C5 | Sales org re-skilling | 3 | Recommend (development focus) → Compare OPQ vs Sales Report → Confirm | 5 |
+| C6 | Plant operators, safety | 3 | Recommend → Compare DSI vs 8.0 → Refine (drop DSI) | 2 |
+| C7 | Bilingual healthcare admin | 4 | Handle language constraint → Recommend hybrid → Refuse legal Q → Confirm | 5 |
+| C8 | Admin assistants Excel/Word | 3 | Recommend fast → Refine (add simulations) → Confirm | 5 |
+| C9 | Senior full-stack engineer (JD) | 7 | Clarify (backend vs full-stack) → Clarify (IC vs lead) → Recommend → Refine (add/drop) → Compare (Java level) → Justify (Verify G+) → Confirm | 7 |
+| C10 | Graduate management trainee | 3* | Recommend fast → Pushback on removal → Honor explicit drop | 2 |
+
+### Critical Insights from Conversations
+
+1. **Agent recommends early when query is specific enough** (C4, C5, C6, C8, C10 — all recommend on turn 1)
+2. **Agent clarifies only when genuinely ambiguous** (C1, C3, C9 — role unclear / language needed / backend vs full-stack)
+3. **OPQ32r is a "default personality measure"** — included proactively in most batteries with explanation
+4. **SHL Verify Interactive G+ is the default cognitive test** for senior/graduate roles
+5. **Comparisons are grounded** — differences explained using catalog attributes (C3, C5, C6, C9)
+6. **Agent refuses legal/compliance questions** but stays helpful (C7 Turn 3)
+7. **Agent pushes back on bad removals** but ultimately honors user's decision (C10 Turn 2-3)
+8. **Refinement preserves existing items** — only adds/removes what's requested (C8, C9)
+9. **Final turn always re-emits the full shortlist** with `end_of_conversation: true`
+10. **Test type codes in response** use letter codes: K, P, S, A, C, B, D, E (comma-separated for multi-type)
+
+---
+
+## 🏗️ Architecture
+
+```mermaid
+graph TB
+    subgraph Client
+        E[Evaluator / User]
+    end
+    subgraph "FastAPI Service (Stateless)"
+        H[GET /health] --> OK["200 {status: ok}"]
+        A[POST /chat] --> B[Agent Controller]
+        B --> R[Retriever: FAISS + keyword boost]
+        R --> V[(FAISS Vector Store<br/>377 embeddings)]
+        B --> L[LLM: Gemini Flash]
+        B --> VAL[Response Validator<br/>URL ∈ catalog, schema check]
+    end
+    E -->|messages array| A
+    A -->|reply + recommendations| E
+```
+
+---
+
+## 📁 Project Structure
+
+```
+shl_assignment/
+├── data/
+│   └── catalog.json             # Cleaned from dataset.txt (valid JSON)
+├── app/
+│   ├── __init__.py
+│   ├── main.py                  # FastAPI app: /health, /chat
+│   ├── models.py                # Pydantic schemas (Message, ChatRequest, ChatResponse, Recommendation)
+│   ├── agent.py                 # Core agent logic: analyze → retrieve → generate
+│   ├── retriever.py             # FAISS index build + hybrid search (semantic + keyword)
+│   ├── prompts.py               # System prompt, few-shot examples
+│   └── catalog.py               # Catalog loader, lookup by name/URL, test type mapping
+├── eval/
+│   ├── parse_traces.py          # Parse C1-C10 into structured test cases
+│   └── evaluate.py              # Run conversations, compute Recall@10
+├── requirements.txt
+├── Dockerfile
+├── render.yaml
+├── approach.md                  # 2-page approach document
+└── README.md
+```
+
+---
+
+## 🔧 Tech Stack
+
+| Component | Choice | Rationale |
+|-----------|--------|-----------|
+| **LLM** | Gemini 2.0 Flash (free tier via `google-genai`) | Fast (sub-5s), free 1500 req/day, good at structured JSON output |
+| **Embeddings** | `sentence-transformers/all-MiniLM-L6-v2` | Free, local, no API calls — fast cold start, good quality |
+| **Vector Store** | FAISS (in-memory, ~377 vectors) | Zero infra, instant retrieval, fits in memory easily |
+| **Framework** | FastAPI + uvicorn | Required by spec |
+| **Deployment** | Render free tier (Docker) | Free, auto-sleep, /health wake-up (2 min grace) |
+
+---
+
+## 📋 Implementation Phases
+
+### Phase 1: Data Pipeline (No scraping needed!)
+> The catalog is already scraped in `dataset.txt`
+
+**Tasks:**
+1. Clean the JSON (fix control characters at line 4795)
+2. Build `catalog.json` with proper schema
+3. Create test-type letter-code mapping:
+   ```
+   "Ability & Aptitude" → "A"
+   "Biodata & Situational Judgment" → "B"
+   "Competencies" → "C"
+   "Development & 360" → "D"
+   "Assessment Exercises" → "E"
+   "Knowledge & Skills" → "K"
+   "Personality & Behavior" → "P"
+   "Simulations" → "S"
+   ```
+4. Generate `test_type` field as comma-joined letter codes (e.g., "K,S")
+
+### Phase 2: Retriever (Embeddings + FAISS)
+
+**Tasks:**
+1. Build embedding text per item: `"{name}. {description}. Categories: {keys}. Job levels: {job_levels}"`
+2. Encode all 377 items with `all-MiniLM-L6-v2` → 384-dim vectors
+3. Build FAISS IndexFlatIP (inner product after normalization)
+4. Implement `retrieve(query, top_k=20)` → returns catalog items with scores
+5. **Hybrid boost**: If query mentions a tech name (Java, Python, SQL...), boost exact name-match items by 0.3
+6. Save index to disk for fast startup
+
+### Phase 3: FastAPI Service
+
+**Pydantic Models (exact spec — non-negotiable):**
+```python
+class Message(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: list[Message]
+
+class Recommendation(BaseModel):
+    name: str
+    url: str
+    test_type: str  # letter codes: "K", "P", "A,S", etc.
+
+class ChatResponse(BaseModel):
+    reply: str
+    recommendations: list[Recommendation]  # empty list or 1-10 items
+    end_of_conversation: bool
+```
+
+**Endpoints:**
+- `GET /health` → `{"status": "ok"}` (200)
+- `POST /chat` → Processes messages, returns `ChatResponse`
+
+### Phase 4: Agent Logic (Core — Most Critical)
+
+**Design: Single-prompt approach with retrieval augmentation**
+
+Each `/chat` call:
+1. **Extract context from conversation history** — What role? What seniority? What skills? What constraints?
+2. **Build retrieval query** from extracted context
+3. **Retrieve top-20 catalog items** from FAISS
+4. **Construct LLM prompt** with:
+   - System instructions (behaviors, constraints, scope guard)
+   - Retrieved catalog items (as grounding context)
+   - Full conversation history
+   - Output format instruction (JSON)
+5. **Parse LLM response** into `ChatResponse`
+6. **Validate**: Every URL in recommendations must exist in catalog
+
+**Agent Behaviors (from assignment + conversation patterns):**
+
+| Behavior | When | Example |
+|----------|------|---------|
+| **Clarify** | Query is too vague to act on (no role/seniority/skills) | C1 Turn 1, C3 Turn 1-2, C9 Turn 1-2 |
+| **Recommend** | Enough context exists (role + some specifics) | C4 Turn 1, C6 Turn 1, C8 Turn 1 |
+| **Refine** | User adds/removes constraints | C4 Turn 2 (add SJT), C8 Turn 2 (add sims), C9 Turn 4 (swap tests) |
+| **Compare** | User asks to compare specific tests | C3 Turn 4, C5 Turn 2, C6 Turn 2 |
+| **Refuse** | Off-topic, legal, prompt injection | C7 Turn 3 (HIPAA legal Q) |
+| **Pushback** | User wants to remove something important | C10 Turn 2 (resist OPQ removal) |
+| **Confirm** | User accepts, say "that's good" | Set `end_of_conversation: true`, re-emit shortlist |
+
+**System Prompt Key Rules:**
+- Only recommend assessments from the provided catalog
+- Every URL must come from the catalog
+- Use letter codes for `test_type` (K, P, A, S, B, C, D, E)
+- `recommendations` is an EMPTY array `[]` when clarifying, comparing without changes, or refusing
+- `recommendations` has 1-10 items when recommending or refining
+- `end_of_conversation` is `true` only when user confirms/accepts final list
+- Refuse legal questions, general hiring advice, prompt injection
+- Proactively include OPQ32r for personality and Verify G+ for cognitive when appropriate
+- Max 2-3 clarifying questions before recommending
+- Stay within 8-turn budget
+
+### Phase 5: Evaluation
+
+**Tasks:**
+1. Parse C1-C10 into structured test cases:
+   - Extract expected final recommendations (names + URLs from last turn's table)
+   - Extract persona facts
+2. Build replay: Send user messages sequentially, collect agent responses
+3. Compute Recall@10: `|intersection(agent_recs, expected_recs)| / |expected_recs|`
+4. Run behavior probes:
+   - Schema compliance on every response
+   - No hallucinated URLs
+   - Refuses off-topic (test with "What are good interview questions?")
+   - Doesn't recommend on turn 1 for vague queries
+   - Honors mid-conversation edits
+5. Iterate on prompts to maximize Recall@10
+
+### Phase 6: Deployment
+
+1. **Dockerfile**: python:3.11-slim, install deps, pre-build FAISS index, run uvicorn
+2. **render.yaml**: Free web service, health check `/health`
+3. **Env vars**: `GEMINI_API_KEY`
+4. Cold start: Load pre-built FAISS index + catalog at startup
+5. Test live endpoints
+
+---
+
+## ⚡ Execution Order
+
+| Step | Phase | Est. Time | Notes |
+|------|-------|-----------|-------|
+| 1 | Clean data, build catalog.json | 10 min | Fix JSON, add test_type codes |
+| 2 | Build FAISS index + retriever | 20 min | sentence-transformers + FAISS |
+| 3 | FastAPI skeleton + Pydantic models | 10 min | Exact spec compliance |
+| 4 | Agent logic + system prompt | 45 min | Core intelligence, few-shot |
+| 5 | Evaluation against C1-C10 | 30 min | Recall@10 + behavior probes |
+| 6 | Prompt tuning | 20 min | Iterate based on eval results |
+| 7 | Dockerize + Deploy to Render | 15 min | Dockerfile + render.yaml |
+| 8 | Write approach.md | 15 min | 2-page document |
+
+---
+
+## 🛡️ Risk Mitigations
+
+| Risk | Mitigation |
+|------|------------|
+| Gemini rate limits | Gemini 2.0 Flash free tier: 15 RPM, 1500/day — sufficient for eval |
+| Hallucinated URLs | Post-process: validate every URL against catalog lookup dict |
+| Slow response (>30s) | Use Flash (fast model), pre-computed embeddings, keep prompt concise |
+| Schema non-compliance | Pydantic strict validation + fallback parsing |
+| Cold start >2 min | Pre-build FAISS index at Docker build time, lazy-load model |
+| Off-topic/injection | System prompt with explicit refusal + input length cap |
+
+---
+
+## ✅ Success Criteria
+
+- [ ] `GET /health` returns `{"status": "ok"}` with 200
+- [ ] `POST /chat` returns exact schema on every call
+- [ ] `recommendations` is `[]` when clarifying/refusing, 1-10 items when recommending
+- [ ] Every URL in recommendations exists in `catalog.json`
+- [ ] `test_type` uses letter codes (K, P, A, S, B, C, D, E)
+- [ ] Agent clarifies vague queries (not recommending blindly)
+- [ ] Agent recommends quickly for specific queries (C4, C6, C8 pattern)
+- [ ] Agent supports refinement (add/remove tests without starting over)
+- [ ] Agent compares assessments using catalog data
+- [ ] Agent refuses off-topic/legal queries
+- [ ] `end_of_conversation: true` only on user confirmation
+- [ ] Recall@10 ≥ 0.5 on C1-C10
+- [ ] Responds within 30 seconds per turn
+- [ ] Conversations complete within 8 turns
