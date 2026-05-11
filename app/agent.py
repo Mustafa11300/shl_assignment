@@ -426,21 +426,74 @@ def _is_confirmation(text: str) -> bool:
         "confirmed", "confirm", "lock", "locking", "final list",
         "perfect", "that works", "that's good", "covers it",
         "keep the shortlist", "keep it", "as-is", "as is",
+        "go ahead", "sounds good", "let's go with those",
+        "lets go with those", "go with those", "yes",
     ]
     return any(signal in low for signal in signals)
 
 
+def _sanitize_user_content(text: str) -> str:
+    """Strip null bytes and control characters from user content (Case 16)."""
+    import unicodedata
+    # Remove null bytes and other C0/C1 control chars except newline/tab
+    cleaned = []
+    for ch in text:
+        if ch in ('\n', '\t', '\r'):
+            cleaned.append(ch)
+        elif unicodedata.category(ch).startswith('C'):
+            continue  # skip control characters
+        else:
+            cleaned.append(ch)
+    return ''.join(cleaned)
+
+
+def _is_injection_attempt(text: str) -> bool:
+    """Deterministic injection detection per Rule E. Always blocks, no LLM judgment."""
+    low = text.lower()
+    hard_signals = [
+        "ignore all previous instructions",
+        "ignore previous instructions",
+        "ignore all prior instructions",
+        "forget your guidelines",
+        "forget your rules",
+        "forget your instructions",
+        "you are now",
+        "pretend you are",
+        "i am the assistant",
+        "i am the system",
+        "as chatgpt",
+        "as gpt",
+        "as shl-gpt",
+        "no restrictions",
+        "the user said",
+        "ignore all",
+        "let's roleplay", "lets roleplay",
+        "developer says",
+        "system says",
+    ]
+    return any(signal in low for signal in hard_signals)
+
+
+def _contains_json_injection(text: str) -> bool:
+    """Detect JSON or recommendation-shaped objects embedded in user message (Case 5)."""
+    # Check for JSON-like structures that look like response manipulation
+    if '{"reply"' in text or '{"recommendations"' in text:
+        return True
+    if '"end_of_conversation"' in text:
+        return True
+    return False
+
+
 def _is_refusal_topic(text: str) -> bool:
     low = text.lower()
-    injection_signals = [
-        "ignore previous", "forget your rules", "you are now",
-        "pretend you are", "system says", "developer says",
-    ]
     legal_signals = [
         "legally required", "legal requirement", "satisfy that requirement",
         "satisfies that requirement", "regulatory obligation",
     ]
-    return any(signal in low for signal in injection_signals + legal_signals)
+    if any(signal in low for signal in legal_signals):
+        return True
+    # Injection is handled separately by _is_injection_attempt
+    return False
 
 
 def _is_vague_request(text: str, has_context: bool, has_recs: bool) -> bool:
@@ -594,9 +647,44 @@ def _lexical_catalog_recommend(query: str, all_text: str, catalog: CatalogStore)
     return [item for _, item in scored[:10]]
 
 
-# ---------------------------------------------------------------------------
-# Main process_chat
-# ---------------------------------------------------------------------------
+def _has_prior_recommendations(messages: list[dict]) -> bool:
+    """Check if any prior assistant turn contained non-empty recommendations."""
+    for msg in messages:
+        if msg["role"] == "assistant":
+            content = msg["content"]
+            try:
+                data = json.loads(content)
+                if data.get("recommendations") and len(data["recommendations"]) > 0:
+                    return True
+            except (json.JSONDecodeError, AttributeError):
+                pass
+    return False
+
+
+def _extract_prior_recommendations(messages: list[dict], catalog: CatalogStore) -> list[Recommendation]:
+    """Extract the most recent non-empty recommendations from assistant turns."""
+    for msg in reversed(messages):
+        if msg["role"] == "assistant":
+            content = msg["content"]
+            try:
+                data = json.loads(content)
+                recs_data = data.get("recommendations", [])
+                if recs_data:
+                    recs = []
+                    for r in recs_data:
+                        if isinstance(r, dict):
+                            item = catalog.get_by_name(r.get("name", ""))
+                            if item:
+                                recs.append(Recommendation(
+                                    name=item["name"], url=item["url"],
+                                    test_type=item["test_type"]
+                                ))
+                    if recs:
+                        return recs
+            except (json.JSONDecodeError, AttributeError):
+                pass
+    return []
+
 
 def process_chat(messages: list[Message]) -> ChatResponse:
     start_time = time.time()
@@ -604,7 +692,33 @@ def process_chat(messages: list[Message]) -> ChatResponse:
 
     msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
 
-    # Post-EOC restart detection
+    # ── Case 16: Sanitize all user content (strip null bytes / control chars) ──
+    for msg in msg_dicts:
+        if msg["role"] == "user":
+            msg["content"] = _sanitize_user_content(msg["content"])
+
+    # ── Case 2: Skip leading assistant messages ──
+    while msg_dicts and msg_dicts[0]["role"] == "assistant":
+        msg_dicts.pop(0)
+
+    # ── Case 3: Merge consecutive user messages into one ──
+    merged = []
+    for msg in msg_dicts:
+        if merged and merged[-1]["role"] == "user" and msg["role"] == "user":
+            merged[-1]["content"] += " " + msg["content"]
+        else:
+            merged.append(msg.copy())
+    msg_dicts = merged
+
+    # If no messages remain after cleanup, treat as empty
+    if not msg_dicts:
+        return ChatResponse(
+            reply="Please start by telling me about the role you are hiring for.",
+            recommendations=[],
+            end_of_conversation=False,
+        )
+
+    # Post-EOC restart detection (Case 12)
     eoc_index = _find_last_eoc_index(msg_dicts)
     if eoc_index is not None and eoc_index < len(msg_dicts) - 1:
         restart_msgs = msg_dicts[eoc_index + 1:]
@@ -627,6 +741,62 @@ def process_chat(messages: list[Message]) -> ChatResponse:
     all_text = " ".join(m["content"] for m in msg_dicts)
     combined = query + " " + all_text
     latest_user = _latest_user_text(msg_dicts)
+
+    # ── Cases 4/5/6/11: Deterministic injection detection ──
+    if _is_injection_attempt(latest_user):
+        # Case 11: If prior recs exist and user tries impersonation, preserve them
+        prior_recs = _extract_prior_recommendations(msg_dicts, catalog)
+        if prior_recs:
+            return ChatResponse(
+                reply="I can only recommend assessments based on the role requirements we discussed. Would you like to refine the current list or add complementary assessments?",
+                recommendations=prior_recs,
+                end_of_conversation=False,
+            )
+        return ChatResponse(
+            reply="I can only help with discovering SHL assessments from the official catalog. What role are you hiring for?",
+            recommendations=[],
+            end_of_conversation=False,
+        )
+
+    # Case 5/6: JSON injection or roleplay with fake catalog items
+    if _contains_json_injection(latest_user):
+        # Strip the injected JSON and process the legitimate part
+        # But if the message is mostly injection, just ask for role
+        clean_part = re.split(r'[{}]', latest_user)[0].strip()
+        if clean_part and len(clean_part) > 10:
+            latest_user = clean_part
+            # Update msg_dicts so downstream uses clean content
+            for msg in reversed(msg_dicts):
+                if msg["role"] == "user":
+                    msg["content"] = clean_part
+                    break
+            # Recompute
+            query = build_query_from_messages(msg_dicts)
+            all_text = " ".join(m["content"] for m in msg_dicts)
+            combined = query + " " + all_text
+        else:
+            return ChatResponse(
+                reply="I'd be happy to help. Could you tell me more about the role — the job level and key skills you need to assess for?",
+                recommendations=[],
+                end_of_conversation=False,
+            )
+
+    # ── Cases 7/8: Premature confirmation guard ──
+    has_prior_recs = _has_prior_recommendations(msg_dicts)
+    if _is_confirmation(latest_user) and not has_prior_recs:
+        # Case 8: First message is confirmation with zero context
+        if len([m for m in msg_dicts if m["role"] == "user"]) <= 1:
+            return ChatResponse(
+                reply="It looks like we haven't discussed any assessments yet. Could you tell me about the role you are hiring for so I can make some recommendations?",
+                recommendations=[],
+                end_of_conversation=False,
+            )
+        # Case 7: Confirmation but no recommendations were made yet
+        return ChatResponse(
+            reply="I still need a bit more context before making recommendations. Could you tell me more about the role, department, or key skills you need to assess?",
+            recommendations=[],
+            end_of_conversation=False,
+        )
 
     # ── Step 1: Rule-based recommendations (always computed) ──────────────
     rule_recs = _rule_based_recommend(query, all_text, catalog)
@@ -652,6 +822,9 @@ def process_chat(messages: list[Message]) -> ChatResponse:
     if has_context and rule_recs and not _llm_enabled():
         response = _deterministic_response(rule_recs, latest_user, catalog, turns_remaining)
         if response.recommendations:
+            # Rule D: Never set end_of_conversation=true if no prior recs exist
+            if response.end_of_conversation and not has_prior_recs and not _is_confirmation(latest_user):
+                response.end_of_conversation = False
             return response
 
     if has_context and not _llm_enabled():
@@ -659,6 +832,8 @@ def process_chat(messages: list[Message]) -> ChatResponse:
         lexical = _inject_canonical_assessments(combined, lexical, catalog)
         response = _deterministic_response(lexical, latest_user, catalog, turns_remaining)
         if response.recommendations:
+            if response.end_of_conversation and not has_prior_recs and not _is_confirmation(latest_user):
+                response.end_of_conversation = False
             return response
 
     if not _llm_enabled():

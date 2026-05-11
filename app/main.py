@@ -90,7 +90,12 @@ async def chat(request: ChatRequest):
         end_of_conversation: true when task is complete
     """
     if not request.messages:
-        raise HTTPException(status_code=400, detail="Messages array cannot be empty")
+        # Case 1: Empty messages array — return valid response, never crash
+        return ChatResponse(
+            reply="Please start by telling me about the role you are hiring for.",
+            recommendations=[],
+            end_of_conversation=False,
+        )
     
     start_time = time.time()
     
