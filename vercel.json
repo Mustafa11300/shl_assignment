@@ -1,23 +1,11 @@
 {
   "buildCommand": "echo 'Static site'",
   "installCommand": "echo 'No dependencies'",
-  "framework": "static",
   "public": ".",
   "rewrites": [
     {
       "source": "/(.*)",
       "destination": "/index.html"
-    }
-  ],
-  "headers": [
-    {
-      "source": "/index.html",
-      "headers": [
-        {
-          "key": "Cache-Control",
-          "value": "no-cache, no-store, must-revalidate"
-        }
-      ]
     }
   ]
 }
