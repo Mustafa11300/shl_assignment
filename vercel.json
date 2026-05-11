@@ -1,14 +1,15 @@
 {
   "version": 2,
-  "public": true,
-  "buildCommand": "echo 'Static site'",
+  "buildCommand": "echo 'Static HTML only'",
+  "installCommand": "echo 'No installation needed'",
   "outputDirectory": "public",
+  "framework": null,
   "env": {
     "SKIP_ENV_VALIDATION": "1"
   },
   "routes": [
     {
-      "src": "/.*",
+      "src": "/(.*)",
       "dest": "/index.html"
     }
   ]
