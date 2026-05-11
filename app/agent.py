@@ -58,7 +58,7 @@ def get_retriever() -> Any:
     if _retriever is None:
         from app.retriever import CatalogRetriever
         _retriever = CatalogRetriever(get_catalog_store())
-        logger.info("FAISS retriever initialized")
+        logger.info("TF-IDF retriever initialized")
     return _retriever
 
 
@@ -668,7 +668,7 @@ def process_chat(messages: list[Message]) -> ChatResponse:
             end_of_conversation=False,
         )
 
-    # ── Step 2: FAISS retrieval ───────────────────────────────────────────
+    # ── Step 2: TF-IDF retrieval ──────────────────────────────────────────
     retriever = get_retriever()
     retrieved = retriever.retrieve(query, top_k=20)
 

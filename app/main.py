@@ -31,14 +31,14 @@ async def lifespan(app: FastAPI):
     logger.info("Starting SHL Assessment Recommender...")
     start = time.time()
     
-    # Pre-load catalog. The FAISS retriever is optional and lazy so the
+    # Pre-load catalog. The retriever is optional and lazy so the
     # deterministic recommender can serve hard-requirement checks quickly.
     catalog = get_catalog_store()
     logger.info(f"Catalog loaded: {len(catalog)} items")
     
     if os.environ.get("PRELOAD_RETRIEVER", "").strip().lower() in {"1", "true", "yes"}:
         retriever = get_retriever()
-        logger.info(f"FAISS index loaded: {retriever.index.ntotal} vectors")
+        logger.info(f"Retriever index loaded: {len(retriever.catalog)} items")
     
     elapsed = time.time() - start
     logger.info(f"Startup complete in {elapsed:.1f}s")
