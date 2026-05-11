@@ -722,6 +722,17 @@ def process_chat(messages: list[Message]) -> ChatResponse:
     eoc_index = _find_last_eoc_index(msg_dicts)
     if eoc_index is not None and eoc_index < len(msg_dicts) - 1:
         restart_msgs = msg_dicts[eoc_index + 1:]
+        # Count how many user messages came AFTER the EOC
+        post_eoc_user_msgs = [m for m in restart_msgs if m["role"] == "user"]
+        if len(post_eoc_user_msgs) <= 1:
+            # First message after EOC: acknowledge the prior session ended
+            # and offer to start fresh instead of immediately recommending
+            latest = post_eoc_user_msgs[0]["content"] if post_eoc_user_msgs else ""
+            return ChatResponse(
+                reply=f"It looks like we've already concluded our previous session. Shall I recommend assessments for a new role? Please describe the position, level, and key skills you'd like to assess.",
+                recommendations=[],
+                end_of_conversation=False,
+            )
     else:
         restart_msgs = None
 
