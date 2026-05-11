@@ -1,0 +1,16 @@
+app/
+venv/
+tests/
+data/
+eval/
+GenAI_SampleConversations/
+*.py
+*.pyc
+__pycache__
+.env
+requirements.txt
+dataset.txt
+Dockerfile
+render.yaml
+*.pdf
+*.docx

@@ -1,7 +1,8 @@
 {
-  "buildCommand": "echo 'Static site'",
-  "installCommand": "echo 'No dependencies'",
-  "public": ".",
+  "version": 2,
+  "buildCommand": "echo 'Serving static HTML'",
+  "outputDirectory": ".",
+  "public": true,
   "rewrites": [
     {
       "source": "/(.*)",
