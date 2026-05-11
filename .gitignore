@@ -6,3 +6,4 @@ data/tfidf_index.pkl
 data/catalog.json
 eval/eval_results.json
 .gemini/
+.vercel

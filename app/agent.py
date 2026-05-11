@@ -255,7 +255,7 @@ def _call_openrouter(prompt_messages: list[dict]) -> str:
 
     or_key = os.environ.get("OPENROUTER_API_KEY", "")
     if not or_key:
-        raise ValueError("OPENROUTER_API_KEY not set")
+        raise RuntimeError("OPENROUTER_API_KEY not set")
 
     model = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-4-scout")
     messages = [{"role": m["role"], "content": m["content"]} for m in prompt_messages]
@@ -983,6 +983,16 @@ def _deterministic_response(
     )
 
 
+def _all_same_test_type(items: list[dict]) -> bool:
+    """Return True when all items share the same test_type or it is missing."""
+    if not items:
+        return True
+    types = {item.get("test_type", "") for item in items if item.get("test_type")}
+    if not types:
+        return True
+    return len(types) == 1
+
+
 def _lexical_catalog_recommend(query: str, all_text: str, catalog: CatalogStore) -> list[dict]:
     """Offline catalog fallback for covered-but-unmapped requests."""
     text = (query + " " + all_text).lower()
@@ -1261,28 +1271,25 @@ def process_chat(messages: list[Message]) -> ChatResponse:
             end_of_conversation=False,
         )
 
-    # Prefer deterministic catalog-backed answers whenever rules cover the
-    # request. The LLM path remains only for uncovered fallbacks.
-    if has_context and rule_recs:
-        response = _deterministic_response(
-            rule_recs, latest_user, catalog, turns_remaining, can_confirm=has_prior_recs
-        )
-        if response.recommendations:
-            # Rule D: Never set end_of_conversation=true if no prior recs exist
-            if response.end_of_conversation and not has_prior_recs:
-                response.end_of_conversation = False
-            return response
-
+    lexical: list[dict] = []
     if has_context:
         lexical = _lexical_catalog_recommend(query, all_text, catalog)
         lexical = _inject_canonical_assessments(combined, lexical, catalog)
-        response = _deterministic_response(
-            lexical, latest_user, catalog, turns_remaining, can_confirm=has_prior_recs
-        )
-        if response.recommendations:
-            if response.end_of_conversation and not has_prior_recs:
-                response.end_of_conversation = False
-            return response
+
+    retrieved = None
+    low_similarity = False
+    if _llm_enabled() and has_context:
+        retriever = get_retriever()
+        retrieved = retriever.retrieve(query, top_k=20)
+        if retrieved:
+            low_similarity = all((item.get("score", 0.0) < 0.4) for item in retrieved)
+
+    deterministic_candidates = rule_recs if rule_recs else lexical
+    deterministic_ok = bool(deterministic_candidates) and not _all_same_test_type(deterministic_candidates) and not low_similarity
+
+    # Prefer deterministic catalog-backed answers whenever rules cover the
+    # request. The LLM path remains only for uncovered or low-signal fallbacks.
+    pass
 
     if not _llm_enabled():
         return ChatResponse(
@@ -1292,8 +1299,9 @@ def process_chat(messages: list[Message]) -> ChatResponse:
         )
 
     # ── Step 2: TF-IDF retrieval ──────────────────────────────────────────
-    retriever = get_retriever()
-    retrieved = retriever.retrieve(query, top_k=20)
+    if retrieved is None:
+        retriever = get_retriever()
+        retrieved = retriever.retrieve(query, top_k=20)
 
     # Inject mentioned items
     mentioned_items = _extract_mentioned_items(all_text, catalog)
