@@ -5,7 +5,7 @@ services:
     plan: free
     healthCheckPath: /health
     envVars:
-      - key: GEMINI_API_KEY
-        sync: false
+      - key: USE_LLM
+        value: "false"
       - key: PORT
         value: 8000

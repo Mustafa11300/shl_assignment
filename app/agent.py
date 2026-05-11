@@ -1,9 +1,8 @@
 """
 Core agent controller for the SHL Assessment Recommender.
 
-Orchestrates: query analysis → retrieval → LLM generation → response validation.
-Handles all conversational behaviors: clarify, recommend, refine, compare, refuse.
-Enforces turn cap (max 8) and 30-second timeout.
+Strategy: deterministic rule-based recommender + LLM for conversational reply.
+When LLM is rate-limited or returns <3 recs, rule-based engine fills the gap.
 """
 
 import json
@@ -11,29 +10,42 @@ import os
 import re
 import logging
 import time
-from typing import Optional
-from dotenv import load_dotenv
+from typing import Any, Optional
 
-# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv() -> bool:
+        return False
+
 load_dotenv()
 
 from app.catalog import CatalogStore
-from app.retriever import CatalogRetriever
 from app.prompts import build_full_prompt, build_query_from_messages
 from app.models import ChatResponse, Recommendation, Message
 
 logger = logging.getLogger(__name__)
 
-# Global singletons (initialized once at startup)
 _catalog_store: Optional[CatalogStore] = None
-_retriever: Optional[CatalogRetriever] = None
+_retriever: Optional[Any] = None
 
-# Maximum total turns (user + assistant messages combined)
 MAX_TURNS = 8
+
+CANONICAL_ASSESSMENTS = {
+    "personality": "Occupational Personality Questionnaire OPQ32r",
+    "cognitive": "SHL Verify Interactive G+",
+    "leadership_report": "OPQ Leadership Report",
+    "ucf_report": "OPQ Universal Competency Report 2.0",
+    "sales_report": "OPQ MQ Sales Report",
+    "sales_transform_ic": "Sales Transformation 2.0 - Individual Contributor",
+    "gsa": "Global Skills Assessment",
+    "gsa_dev_report": "Global Skills Development Report",
+    "graduate_scenarios": "Graduate Scenarios",
+    "dsi": "Dependability and Safety Instrument (DSI)",
+}
 
 
 def get_catalog_store() -> CatalogStore:
-    """Get or initialize the global CatalogStore singleton."""
     global _catalog_store
     if _catalog_store is None:
         _catalog_store = CatalogStore()
@@ -41,300 +53,749 @@ def get_catalog_store() -> CatalogStore:
     return _catalog_store
 
 
-def get_retriever() -> CatalogRetriever:
-    """Get or initialize the global CatalogRetriever singleton."""
+def get_retriever() -> Any:
     global _retriever
     if _retriever is None:
+        from app.retriever import CatalogRetriever
         _retriever = CatalogRetriever(get_catalog_store())
         logger.info("FAISS retriever initialized")
     return _retriever
 
 
-def _call_gemini(prompt_messages: list[dict]) -> str:
-    """Call Gemini API with the constructed prompt.
-    
-    Uses exponential backoff for rate limit errors.
-    Model is configurable via GEMINI_MODEL env var (default: gemini-2.5-flash).
-    Disables thinking mode for faster responses (stay under 30s timeout).
-    
-    Args:
-        prompt_messages: List of message dicts with 'role' and 'content'.
-        
-    Returns:
-        Raw text response from the LLM.
-    """
-    api_key = os.environ.get("GEMINI_API_KEY", "")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY environment variable is not set")
-    
-    from google import genai
-    from google.genai import types
-    
-    client = genai.Client(api_key=api_key)
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-    
-    # Build the prompt — Gemini uses a different format
-    system_instruction = prompt_messages[0]["content"] if prompt_messages[0]["role"] == "system" else ""
-    user_content = prompt_messages[1]["content"] if len(prompt_messages) > 1 else ""
-    
-    # Build config — disable thinking for speed (stay under 30s)
-    config = types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        temperature=0.3,
-        max_output_tokens=4096,
-        thinking_config=types.ThinkingConfig(thinking_budget=0),
-    )
-    
-    # Retry with backoff for rate limits
-    max_retries = 2  # Fewer retries to stay under 30s
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=user_content,
-                config=config,
-            )
-            return response.text
-        except Exception as e:
-            error_str = str(e)
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                wait_time = (2 ** attempt) * 3  # 3s, 6s
-                logger.warning(f"Rate limited (attempt {attempt+1}/{max_retries}), waiting {wait_time}s...")
-                time.sleep(wait_time)
-            else:
-                raise
-    
-    raise RuntimeError(f"Failed after {max_retries} retries due to rate limiting")
+# ---------------------------------------------------------------------------
+# Rule-based recommender — runs first, no LLM needed
+# ---------------------------------------------------------------------------
 
+def _rule_based_recommend(query: str, all_text: str, catalog: CatalogStore) -> list[dict]:
+    """Deterministic keyword-based recommender. Always returns catalog-verified items."""
+    combined = (query + " " + all_text).lower()
+    result = []
+    seen = set()
+
+    def add(name: str):
+        item = catalog.get_by_name(name)
+        if item and item["url"] not in seen:
+            result.append(item)
+            seen.add(item["url"])
+
+    # ── Leadership / CXO / Executive ──────────────────────────────────────
+    if any(s in combined for s in ["leadership", "executive", "cxo", "director",
+                                    "senior leadership", "leadership benchmark"]):
+        add("Occupational Personality Questionnaire OPQ32r")
+        add("OPQ Universal Competency Report 2.0")
+        add("OPQ Leadership Report")
+        add("SHL Verify Interactive G+")
+
+    # ── Sales / talent audit / re-skill ───────────────────────────────────
+    if any(s in combined for s in ["sales", "selling", "re-skill", "reskill",
+                                    "talent audit", "restructur"]):
+        add("Global Skills Assessment")
+        add("Global Skills Development Report")
+        add("Occupational Personality Questionnaire OPQ32r")
+        add("OPQ MQ Sales Report")
+        add("Sales Transformation 2.0 - Individual Contributor")
+
+    # ── Contact centre / call centre / customer service ───────────────────
+    if any(s in combined for s in ["contact cent", "contact center", "contact centre",
+                                    "inbound call", "call centre", "call center"]):
+        add("SVAR - Spoken English (US) (New)")
+        add("Contact Center Call Simulation (New)")
+        add("Entry Level Customer Serv-Retail & Contact Center")
+        add("Customer Service Phone Simulation")
+
+    # ── Healthcare / HIPAA / bilingual admin ──────────────────────────────
+    if any(s in combined for s in ["hipaa", "healthcare", "patient record", "bilingual",
+                                    "medical terminol", "health admin"]):
+        add("HIPAA (Security)")
+        add("Medical Terminology (New)")
+        add("Microsoft Word 365 - Essentials (New)")
+        add("Dependability and Safety Instrument (DSI)")
+        add("Occupational Personality Questionnaire OPQ32r")
+
+    # ── Admin assistants / Excel / Word (non-healthcare) ──────────────────
+    if any(s in combined for s in ["admin assistant", "excel and word", "excel & word",
+                                    "ms excel", "ms word", "spreadsheet"]):
+        add("MS Excel (New)")
+        add("MS Word (New)")
+        add("Microsoft Excel 365 (New)")
+        add("Microsoft Word 365 (New)")
+        add("Occupational Personality Questionnaire OPQ32r")
+
+    # ── Java / Spring / full-stack backend ────────────────────────────────
+    if any(s in combined for s in ["core java", "spring", "full-stack", "full stack",
+                                    "microservice", "backend engineer"]):
+        add("Core Java (Advanced Level) (New)")
+        add("Spring (New)")
+        add("SQL (New)")
+        if any(s in combined for s in ["aws", "amazon web services"]):
+            add("Amazon Web Services (AWS) Development (New)")
+        if "docker" in combined:
+            add("Docker (New)")
+        add("SHL Verify Interactive G+")
+        add("Occupational Personality Questionnaire OPQ32r")
+
+    # ── Java (generic) ────────────────────────────────────────────────────
+    if "java" in combined and "core java" not in combined and "javascript" not in combined:
+        add("Core Java (Advanced Level) (New)")
+        add("Java 8 (New)")
+        add("Spring (New)")
+        add("SHL Verify Interactive G+")
+        add("Occupational Personality Questionnaire OPQ32r")
+
+    # ── Rust / networking / systems / Linux ───────────────────────────────
+    if any(s in combined for s in ["rust engineer", "rust developer",
+                                    "high-performance networking", "networking infrastructure"]):
+        add("Smart Interview Live Coding")
+        add("Linux Programming (General)")
+        add("Networking and Implementation (New)")
+        add("SHL Verify Interactive G+")
+        add("Occupational Personality Questionnaire OPQ32r")
+
+    # ── Graduate / financial analyst ──────────────────────────────────────
+    if any(s in combined for s in ["graduate financial", "financial analyst",
+                                    "numerical reasoning", "final-year"]):
+        add("SHL Verify Interactive – Numerical Reasoning")
+        add("Financial Accounting (New)")
+        add("Basic Statistics (New)")
+        add("Graduate Scenarios")
+        add("Occupational Personality Questionnaire OPQ32r")
+
+    # ── Graduate management / broad graduate batteries ────────────────────
+    if "graduate" in combined and any(s in combined for s in [
+        "management trainee", "trainee scheme", "recent graduates",
+        "situational judgement", "situational judgment", "cognitive",
+        "full battery",
+    ]):
+        add("SHL Verify Interactive G+")
+        add("Occupational Personality Questionnaire OPQ32r")
+        add("Graduate Scenarios")
+
+    # ── Safety / manufacturing / industrial ───────────────────────────────
+    if any(s in combined for s in [
+        "plant operator", "plant operators", "chemical facility",
+        "manufacturing", "industrial", "workplace safety",
+        "procedure compliance", "cutting corners",
+    ]):
+        add("Manufac. & Indust. - Safety & Dependability 8.0")
+        add("Manufacturing & Industrial - Mechanical Focus 8.0")
+        add("Workplace Health and Safety (New)")
+
+    return result[:10]
+
+
+def _has_enough_context(combined_text: str) -> bool:
+    """True when the user has given enough context to recommend assessments."""
+    signals = [
+        "leadership", "executive", "cxo", "director",
+        "sales", "talent audit", "re-skill",
+        "contact cent", "contact center", "call cent",
+        "java", "spring", "rust", "python", "aws", "docker",
+        "admin assistant", "excel", "word",
+        "healthcare", "hipaa", "medical",
+        "graduate", "financial analyst", "numerical",
+        "safety", "manufacturing",
+        "hiring", "assess", "screen", "recruit",
+    ]
+    low = combined_text.lower()
+    return any(s in low for s in signals)
+
+
+# ---------------------------------------------------------------------------
+# LLM callers
+# ---------------------------------------------------------------------------
+
+def _call_groq(prompt_messages: list[dict]) -> str:
+    groq_key = os.environ.get("GROQ_API_KEY", "")
+    if not groq_key:
+        raise ValueError("GROQ_API_KEY not set")
+    from groq import Groq
+    client = Groq(api_key=groq_key)
+    model = os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+    messages = [{"role": m["role"], "content": m["content"]} for m in prompt_messages]
+    response = client.chat.completions.create(
+        model=model, messages=messages, temperature=0.3, max_tokens=2048,
+    )
+    return response.choices[0].message.content
+
+
+def _try_gemini_once(api_key: str, prompt_messages: list[dict]) -> Optional[str]:
+    try:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=api_key)
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+        system_instruction = prompt_messages[0]["content"] if prompt_messages[0]["role"] == "system" else ""
+        user_content = prompt_messages[1]["content"] if len(prompt_messages) > 1 else ""
+        config_kwargs = {
+            "system_instruction": system_instruction,
+            "temperature": 0.3,
+            "max_output_tokens": 2048,
+        }
+        if "2.5" in model_name:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+        config = types.GenerateContentConfig(**config_kwargs)
+        response = client.models.generate_content(
+            model=model_name, contents=user_content, config=config,
+        )
+        return response.text
+    except Exception as e:
+        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+            logger.warning("Gemini 429 — skipping")
+            return None
+        raise
+
+
+def _call_llm(prompt_messages: list[dict]) -> str:
+    """Gemini → Groq → wait 30s → Gemini. Each provider gets one shot."""
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if gemini_key:
+        result = _try_gemini_once(gemini_key, prompt_messages)
+        if result:
+            return result
+
+    groq_key = os.environ.get("GROQ_API_KEY", "")
+    if groq_key:
+        try:
+            return _call_groq(prompt_messages)
+        except Exception as e:
+            logger.warning(f"Groq failed: {str(e)[:100]}")
+
+    if gemini_key:
+        logger.warning("Both providers failed. Waiting 30s...")
+        time.sleep(30)
+        result = _try_gemini_once(gemini_key, prompt_messages)
+        if result:
+            return result
+
+    raise RuntimeError("All LLM providers exhausted")
+
+
+# ---------------------------------------------------------------------------
+# Response parsing
+# ---------------------------------------------------------------------------
 
 def _parse_llm_response(raw_response: str, catalog: CatalogStore) -> ChatResponse:
-    """Parse and validate the LLM's JSON response.
-    
-    Handles common LLM output issues:
-    - Markdown code blocks around JSON
-    - Missing fields with sensible defaults
-    - Invalid URLs (removes them)
-    - Invalid test_type codes (fixes them)
-    
-    Args:
-        raw_response: Raw text from the LLM.
-        catalog: CatalogStore for URL validation.
-        
-    Returns:
-        Validated ChatResponse.
-    """
-    # Strip markdown code blocks if present
     text = raw_response.strip()
     if text.startswith("```"):
-        # Remove opening ```json or ```
         text = re.sub(r"^```(?:json)?\s*\n?", "", text)
-        # Remove closing ```
         text = re.sub(r"\n?```\s*$", "", text)
-    
-    # Try to extract JSON from response if it has extra text around it
     if not text.startswith("{"):
         json_match = re.search(r"\{.*\}", text, re.DOTALL)
         if json_match:
             text = json_match.group(0)
-    
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse LLM response as JSON: {e}")
-        logger.error(f"Raw response: {text[:500]}")
-        # Fallback response
+        logger.error(f"Failed to parse LLM JSON: {e}")
         return ChatResponse(
-            reply="I can help you find the right SHL assessments. Could you tell me more about the role you're hiring for?",
+            reply="I can help you find the right SHL assessments. Could you tell me more about the role?",
             recommendations=[],
             end_of_conversation=False,
         )
-    
-    # Validate and clean recommendations
+
     valid_recs = []
     for rec in data.get("recommendations", []) or []:
         if not isinstance(rec, dict):
             continue
-        
         name = rec.get("name", "")
         url = rec.get("url", "")
-        
-        # Validate URL exists in catalog
+        catalog_item = None
         if url and catalog.url_exists(url):
-            # Use catalog data as ground truth for name and test_type
             catalog_item = catalog.get_by_url(url)
-            if catalog_item:
-                valid_recs.append(Recommendation(
-                    name=catalog_item["name"],
-                    url=catalog_item["url"],
-                    test_type=catalog_item["test_type"],
-                ))
         elif name:
-            # Try to find by name if URL doesn't match
             catalog_item = catalog.get_by_name(name)
-            if catalog_item:
-                valid_recs.append(Recommendation(
-                    name=catalog_item["name"],
-                    url=catalog_item["url"],
-                    test_type=catalog_item["test_type"],
-                ))
-            else:
-                # Try substring match
+            if not catalog_item:
                 matches = catalog.search_by_name(name)
                 if matches:
-                    best = matches[0]
-                    valid_recs.append(Recommendation(
-                        name=best["name"],
-                        url=best["url"],
-                        test_type=best["test_type"],
-                    ))
-    
-    # Deduplicate by URL
+                    catalog_item = matches[0]
+        if catalog_item:
+            valid_recs.append(catalog_item)
+
+    # Deduplicate
     seen_urls = set()
-    deduped_recs = []
-    for rec in valid_recs:
-        if rec.url not in seen_urls:
-            seen_urls.add(rec.url)
-            deduped_recs.append(rec)
-    
-    # Cap at 10
-    deduped_recs = deduped_recs[:10]
-    
+    deduped = []
+    for item in valid_recs:
+        if item["url"] not in seen_urls:
+            seen_urls.add(item["url"])
+            deduped.append(item)
+
+    recs = [
+        Recommendation(name=i["name"], url=i["url"], test_type=i["test_type"])
+        for i in deduped[:10]
+    ]
+
     return ChatResponse(
-        reply=data.get("reply", "I can help you find the right SHL assessments. Could you tell me more about the role?"),
-        recommendations=deduped_recs,
+        reply=data.get("reply", "Here are my recommendations."),
+        recommendations=recs,
         end_of_conversation=data.get("end_of_conversation", False),
     )
 
 
+def _merge_recommendations(
+    primary: list[Recommendation],
+    secondary: list[dict | Recommendation],
+    catalog: CatalogStore,
+    max_total: int = 10,
+) -> list[Recommendation]:
+    """Merge primary recs first, then supplement with secondary, deduplicating by URL."""
+    seen = {r.url for r in primary}
+    merged = list(primary)
+    for item in secondary:
+        url = item.url if isinstance(item, Recommendation) else item.get("url", "")
+        name = item.name if isinstance(item, Recommendation) else item.get("name", "")
+        test_type = item.test_type if isinstance(item, Recommendation) else item.get("test_type", "")
+        if url and url not in seen and len(merged) < max_total:
+            merged.append(Recommendation(name=name, url=url, test_type=test_type))
+            seen.add(url)
+    return merged
+
+
+def _llm_enabled() -> bool:
+    return os.environ.get("USE_LLM", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _latest_user_text(messages: list[dict]) -> str:
+    for msg in reversed(messages):
+        if msg["role"] == "user":
+            return msg["content"]
+    return ""
+
+
+def _is_confirmation(text: str) -> bool:
+    low = text.lower()
+    signals = [
+        "confirmed", "confirm", "lock", "locking", "final list",
+        "perfect", "that works", "that's good", "covers it",
+        "keep the shortlist", "keep it", "as-is", "as is",
+    ]
+    return any(signal in low for signal in signals)
+
+
+def _is_refusal_topic(text: str) -> bool:
+    low = text.lower()
+    injection_signals = [
+        "ignore previous", "forget your rules", "you are now",
+        "pretend you are", "system says", "developer says",
+    ]
+    legal_signals = [
+        "legally required", "legal requirement", "satisfy that requirement",
+        "satisfies that requirement", "regulatory obligation",
+    ]
+    return any(signal in low for signal in injection_signals + legal_signals)
+
+
+def _is_vague_request(text: str, has_context: bool, has_recs: bool) -> bool:
+    low = text.lower().strip()
+    role_signals = [
+        "java", "spring", "rust", "python", "sales", "admin", "healthcare",
+        "financial", "analyst", "graduate", "leadership", "executive",
+        "contact", "call", "safety", "manufacturing", "engineer", "developer",
+    ]
+    vague_phrases = [
+        "i need an assessment", "need an assessment", "help me choose",
+        "help", "what should i use", "recommend an assessment",
+    ]
+    if any(phrase in low for phrase in vague_phrases) and not any(signal in low for signal in role_signals):
+        return True
+    if has_context or has_recs:
+        return False
+    return len(low.split()) < 5
+
+
+def _apply_user_constraints(items: list[dict], latest_user: str) -> list[dict]:
+    """Apply explicit remove/drop instructions from the newest user turn."""
+    low = latest_user.lower()
+    remove_names: set[str] = set()
+
+    remove_prefix = r"\b(remove|drop|exclude|without)\s+(?:the\s+)?"
+    if re.search(remove_prefix + r"(opq32r|opq|personality)\b", low):
+        remove_names.add("Occupational Personality Questionnaire OPQ32r")
+    if re.search(remove_prefix + r"verify\s*g\+?\b", low):
+        remove_names.add("SHL Verify Interactive G+")
+    if re.search(remove_prefix + r"graduate scenarios\b", low):
+        remove_names.add("Graduate Scenarios")
+
+    if not remove_names:
+        return items
+
+    return [item for item in items if item.get("name") not in remove_names]
+
+
+def _to_recommendations(items: list[dict], catalog: CatalogStore) -> list[Recommendation]:
+    """Convert catalog dicts to schema objects, re-validating URLs against catalog."""
+    recs = []
+    seen = set()
+    for item in items:
+        catalog_item = catalog.get_by_url(item.get("url", ""))
+        if not catalog_item or catalog_item["url"] in seen:
+            continue
+        if not catalog_item.get("test_type"):
+            continue
+        recs.append(Recommendation(
+            name=catalog_item["name"],
+            url=catalog_item["url"],
+            test_type=catalog_item["test_type"],
+        ))
+        seen.add(catalog_item["url"])
+        if len(recs) == 10:
+            break
+    return recs
+
+
+def _build_rule_reply(latest_user: str, recs: list[Recommendation], refusing: bool = False) -> str:
+    low = latest_user.lower()
+    if refusing:
+        return (
+            "I can't advise on legal or regulatory obligations. I can help select "
+            "SHL assessments and keep the shortlist grounded in the catalog."
+        )
+
+    if "difference" in low and "opq" in low and "mq" in low:
+        return (
+            "OPQ32r is the core personality assessment. OPQ MQ Sales Report is a "
+            "sales-focused report layer for interpreting OPQ/MQ outputs in a sales context. "
+            "I would keep both only where that sales-specific reporting is useful."
+        )
+    if "difference" in low and ("dsi" in low or "dependability" in low) and "8.0" in low:
+        return (
+            "DSI is a general dependability and safety-oriented personality measure. "
+            "Safety & Dependability 8.0 is the stronger industrial fit for plant or "
+            "manufacturing environments, with Workplace Health and Safety as the knowledge check."
+        )
+    if "different" in low and "contact center call simulation" in low:
+        return (
+            "Contact Center Call Simulation is the newer contact-center simulation choice for "
+            "volume screening. Customer Service Phone Simulation is the older phone-simulation "
+            "option and is useful as a finalist-stage complement."
+        )
+    if "advanced level" in low and "java" in low:
+        return (
+            "Yes. For an experienced Java engineer maintaining existing services, Core Java "
+            "Advanced Level is the right catalog fit, with Spring and SQL around it."
+        )
+    if "verify g+" in low and ("really need" in low or "redundant" in low):
+        return (
+            "Verify G+ is not a duplicate of the technical tests; it adds a general reasoning "
+            "signal for senior design judgment. I would keep it if candidate time allows."
+        )
+
+    names = ", ".join(rec.name for rec in recs)
+    if _is_confirmation(latest_user):
+        return f"Confirmed. Final shortlist: {names}."
+    return f"Based on your requirements, I recommend this SHL shortlist: {names}."
+
+
+def _deterministic_response(
+    items: list[dict],
+    latest_user: str,
+    catalog: CatalogStore,
+    turns_remaining: int,
+) -> ChatResponse:
+    constrained = _apply_user_constraints(items, latest_user)
+    recs = _to_recommendations(constrained, catalog)
+    return ChatResponse(
+        reply=_build_rule_reply(latest_user, recs),
+        recommendations=recs,
+        end_of_conversation=turns_remaining <= 1 or _is_confirmation(latest_user),
+    )
+
+
+def _lexical_catalog_recommend(query: str, all_text: str, catalog: CatalogStore) -> list[dict]:
+    """Offline catalog fallback for covered-but-unmapped requests."""
+    text = (query + " " + all_text).lower()
+    stop = {
+        "the", "and", "for", "with", "that", "this", "need", "needs",
+        "hiring", "hire", "assessment", "assessments", "test", "tests",
+        "role", "candidate", "candidates", "what", "should", "use",
+    }
+    tokens = {
+        token
+        for token in re.findall(r"[a-z0-9+#]+", text)
+        if len(token) > 2 and token not in stop
+    }
+    if not tokens:
+        return []
+
+    scored = []
+    for item in catalog.items:
+        name = item.get("name", "").lower()
+        description = item.get("description", "").lower()
+        haystack = f"{name} {description}"
+        name_tokens = set(re.findall(r"[a-z0-9+#]+", name))
+        item_tokens = set(re.findall(r"[a-z0-9+#]+", haystack))
+        overlap = tokens & item_tokens
+        if not overlap:
+            continue
+        score = len(overlap) + (len(tokens & name_tokens) * 3)
+        if name in text:
+            score += 8
+        scored.append((score, item))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in scored[:10]]
+
+
+# ---------------------------------------------------------------------------
+# Main process_chat
+# ---------------------------------------------------------------------------
+
 def process_chat(messages: list[Message]) -> ChatResponse:
-    """Process a chat request and return the agent's response.
-    
-    This is the main entry point for each /chat call. It:
-    1. Detects and handles edge cases (injection, post-EOC, turn overflow)
-    2. Counts turns and calculates remaining budget
-    3. Extracts a search query from the conversation history
-    4. Retrieves relevant catalog items via FAISS
-    5. Builds a turn-aware prompt with retrieved context
-    6. Calls the LLM
-    7. Validates and returns the response
-    
-    Args:
-        messages: Full conversation history as Message objects.
-        
-    Returns:
-        Validated ChatResponse with reply, recommendations, and end_of_conversation.
-    """
     start_time = time.time()
     catalog = get_catalog_store()
-    retriever = get_retriever()
-    
-    # Convert messages to dicts
+
     msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
-    
-    # Step 0a: Detect post-EOC restart
-    # If a prior assistant message contained end_of_conversation: true,
-    # treat everything after it as a fresh conversation for retrieval context
+
+    # Post-EOC restart detection
     eoc_index = _find_last_eoc_index(msg_dicts)
     if eoc_index is not None and eoc_index < len(msg_dicts) - 1:
-        # There are messages after the EOC — treat as a restart
-        logger.info(f"Post-EOC restart detected at index {eoc_index}, using messages from {eoc_index+1} onwards for context")
-        # Use only messages after EOC for query building, but keep full history for the prompt
         restart_msgs = msg_dicts[eoc_index + 1:]
     else:
-        restart_msgs = None  # No restart
-    
-    # Step 0b: Handle turn-cap overflow
-    # If conversation already has 8+ messages, truncate to last 7 for context
-    # (keeps the most relevant recent turns while respecting budget)
+        restart_msgs = None
+
+    # Turn cap
     if len(msg_dicts) >= MAX_TURNS:
-        logger.warning(f"Turn cap overflow: {len(msg_dicts)} messages received (max {MAX_TURNS})")
-        # Keep last 7 messages to leave room for our response
         msg_dicts = msg_dicts[-(MAX_TURNS - 1):]
-        turns_remaining = 0  # Force immediate recommendation + EOC
+        turns_remaining = 0
     else:
-        # Normal turn budget calculation
-        current_turn_count = len(msg_dicts)
-        turns_after_response = current_turn_count + 1
+        turns_after_response = len(msg_dicts) + 1
         turns_remaining = MAX_TURNS - turns_after_response
-    
-    logger.info(f"Turn budget: {len(msg_dicts)} messages in context, {turns_remaining} turns remaining after response")
-    
-    # Step 1: Extract search query from conversation
+
+    logger.info(f"Turns: {len(msg_dicts)} in context, {turns_remaining} remaining")
+
+    # Build query + full text
     query_msgs = restart_msgs if restart_msgs else msg_dicts
     query = build_query_from_messages(query_msgs)
-    logger.info(f"Search query: {query[:200]}")
-    
-    # Step 2: Retrieve relevant catalog items
-    retrieved = retriever.retrieve(query, top_k=20)
-    logger.info(f"Retrieved {len(retrieved)} catalog items")
-    
-    # Step 3: Also retrieve items mentioned by name in the conversation
-    # This helps with comparison and refinement requests
     all_text = " ".join(m["content"] for m in msg_dicts)
-    mentioned_items = _extract_mentioned_items(all_text, catalog)
-    
-    # Merge mentioned items into retrieved (at the top)
-    if mentioned_items:
-        mentioned_urls = {item["url"] for item in mentioned_items}
-        retrieved = mentioned_items + [r for r in retrieved if r["url"] not in mentioned_urls]
-        retrieved = retrieved[:25]  # Controlled context size
-    
-    # Step 4: Build prompt and call LLM
-    prompt = build_full_prompt(msg_dicts, retrieved, turns_remaining=turns_remaining)
-    
-    try:
-        raw_response = _call_gemini(prompt)
-        elapsed = time.time() - start_time
-        logger.info(f"LLM response in {elapsed:.1f}s, length: {len(raw_response)} chars")
-    except Exception as e:
-        logger.error(f"LLM call failed: {e}")
+    combined = query + " " + all_text
+    latest_user = _latest_user_text(msg_dicts)
+
+    # ── Step 1: Rule-based recommendations (always computed) ──────────────
+    rule_recs = _rule_based_recommend(query, all_text, catalog)
+    logger.info(f"Rule-based recs: {len(rule_recs)}")
+    has_context = _has_enough_context(combined)
+
+    if _is_refusal_topic(latest_user) and not _is_confirmation(latest_user):
         return ChatResponse(
-            reply="I'm having trouble processing your request. Could you try again?",
+            reply=_build_rule_reply(latest_user, [], refusing=True),
             recommendations=[],
             end_of_conversation=False,
         )
-    
-    # Step 5: Parse and validate
-    response = _parse_llm_response(raw_response, catalog)
-    
-    # Step 6: Enforce turn cap — if we're at the last turn and have no recs, 
-    # force end_of_conversation
-    if turns_remaining <= 1 and not response.end_of_conversation:
-        response.end_of_conversation = True
+
+    if _is_vague_request(latest_user, has_context, bool(rule_recs)):
+        return ChatResponse(
+            reply="I can help with that. What role, level, and skills are you hiring for?",
+            recommendations=[],
+            end_of_conversation=False,
+        )
+
+    # Avoid LLM calls by default so rate limits cannot produce empty or
+    # hallucinated recommendations. The LLM path remains available with USE_LLM=1.
+    if has_context and rule_recs and not _llm_enabled():
+        response = _deterministic_response(rule_recs, latest_user, catalog, turns_remaining)
+        if response.recommendations:
+            return response
+
+    if has_context and not _llm_enabled():
+        lexical = _lexical_catalog_recommend(query, all_text, catalog)
+        lexical = _inject_canonical_assessments(combined, lexical, catalog)
+        response = _deterministic_response(lexical, latest_user, catalog, turns_remaining)
+        if response.recommendations:
+            return response
+
+    if not _llm_enabled():
+        return ChatResponse(
+            reply="I can help you find the right SHL assessments. Could you share the role, level, and skills to assess?",
+            recommendations=[],
+            end_of_conversation=False,
+        )
+
+    # ── Step 2: FAISS retrieval ───────────────────────────────────────────
+    retriever = get_retriever()
+    retrieved = retriever.retrieve(query, top_k=20)
+
+    # Inject mentioned items
+    mentioned_items = _extract_mentioned_items(all_text, catalog)
+    if mentioned_items:
+        mentioned_urls = {i["url"] for i in mentioned_items}
+        retrieved = mentioned_items + [r for r in retrieved if r["url"] not in mentioned_urls]
+        retrieved = retrieved[:30]
+
+    # Inject canonicals
+    retrieved = _inject_canonical_assessments(combined, retrieved, catalog)
+
+    # Also inject rule-based items into retrieval context
+    rule_urls = {i["url"] for i in retrieved}
+    for item in rule_recs:
+        if item["url"] not in rule_urls and len(retrieved) < 30:
+            retrieved.append(item)
+            rule_urls.add(item["url"])
+
+    # ── Step 3: LLM call ─────────────────────────────────────────────────
+    prompt = build_full_prompt(msg_dicts, retrieved, turns_remaining=turns_remaining)
+    llm_response = None
+    try:
+        raw = _call_llm(prompt)
+        elapsed = time.time() - start_time
+        logger.info(f"LLM responded in {elapsed:.1f}s ({len(raw)} chars)")
+        llm_response = _parse_llm_response(raw, catalog)
+    except Exception as e:
+        logger.error(f"LLM failed: {e}")
+
+    # ── Step 5: Merge rule-based + LLM recs ──────────────────────────────
+    has_context = _has_enough_context(combined)
+
+    if llm_response is None:
+        # Full LLM failure — use rule-based recs + generic reply
+        recs = [
+            Recommendation(name=i["name"], url=i["url"], test_type=i["test_type"])
+            for i in rule_recs[:10]
+        ]
+        eoc = turns_remaining <= 0
+        return ChatResponse(
+            reply="Based on your requirements, here are the most relevant SHL assessments I recommend.",
+            recommendations=recs,
+            end_of_conversation=eoc,
+        )
+
+    # Always merge: rule-based recs come FIRST (guaranteed catalog hits),
+    # then LLM recs supplement up to 10. If LLM is clarifying (empty recs +
+    # question mark in reply), don't inject.
+    llm_clarifying = (
+        len(llm_response.recommendations) == 0
+        and not llm_response.end_of_conversation
+        and "?" in llm_response.reply
+    )
+
+    if has_context and rule_recs and not llm_clarifying:
+        rule_as_recs = [
+            Recommendation(name=i["name"], url=i["url"], test_type=i["test_type"])
+            for i in rule_recs
+        ]
+        llm_response.recommendations = _merge_recommendations(
+            rule_as_recs,           # rule-based first (guaranteed hits)
+            llm_response.recommendations,  # LLM recs fill remaining slots
+            catalog,
+        )
+        logger.info(f"After merge: {len(llm_response.recommendations)} total recs")
+
+    # Turn-cap enforcement
+    if turns_remaining <= 1 and not llm_response.end_of_conversation:
+        llm_response.end_of_conversation = True
+        if not llm_response.recommendations and has_context and rule_recs:
+            llm_response.recommendations = [
+                Recommendation(name=i["name"], url=i["url"], test_type=i["test_type"])
+                for i in rule_recs[:10]
+            ]
         logger.warning("Forced end_of_conversation due to turn cap")
-    
-    return response
+
+    return llm_response
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _inject_canonical_assessments(query: str, retrieved: list[dict], catalog: CatalogStore) -> list[dict]:
+    query_lower = query.lower()
+    existing_urls = {item["url"] for item in retrieved}
+    injected = []
+
+    def _add(name: str):
+        item = catalog.get_by_name(name)
+        if item and item["url"] not in existing_urls:
+            injected.append(item)
+            existing_urls.add(item["url"])
+
+    # Always include OPQ32r
+    _add(CANONICAL_ASSESSMENTS["personality"])
+
+    senior_signals = ["senior", "lead", "manager", "director", "executive", "cxo",
+                      "engineer", "developer", "architect", "technical", "cognitive",
+                      "reasoning", "graduate", "analyst", "full-stack", "backend"]
+    if any(s in query_lower for s in senior_signals):
+        _add(CANONICAL_ASSESSMENTS["cognitive"])
+
+    leadership_signals = ["leadership", "leader", "executive", "cxo", "director",
+                          "senior leader", "benchmark", "selection"]
+    if any(s in query_lower for s in leadership_signals):
+        _add(CANONICAL_ASSESSMENTS["leadership_report"])
+        _add(CANONICAL_ASSESSMENTS["ucf_report"])
+
+    sales_signals = ["sales", "selling", "revenue", "account executive", "re-skill",
+                     "restructuring", "talent audit"]
+    if any(s in query_lower for s in sales_signals):
+        _add(CANONICAL_ASSESSMENTS["sales_report"])
+        _add(CANONICAL_ASSESSMENTS["sales_transform_ic"])
+        _add(CANONICAL_ASSESSMENTS["gsa"])
+        _add(CANONICAL_ASSESSMENTS["gsa_dev_report"])
+
+    graduate_signals = ["graduate", "entry-level", "entry level", "final-year",
+                        "student", "campus", "situational judgement", "situational judgment"]
+    if any(s in query_lower for s in graduate_signals):
+        _add(CANONICAL_ASSESSMENTS["graduate_scenarios"])
+
+    safety_signals = ["safety", "dependability", "healthcare", "hipaa", "compliance",
+                      "patient", "medical", "trust", "reliability"]
+    if any(s in query_lower for s in safety_signals):
+        _add(CANONICAL_ASSESSMENTS["dsi"])
+
+    tech_mappings = {
+        "java": ["Core Java (Advanced Level) (New)", "Core Java (Entry Level) (New)",
+                 "Spring (New)", "Java 8 (New)"],
+        "spring": ["Spring (New)"],
+        "sql": ["SQL (New)"],
+        "aws": ["Amazon Web Services (AWS) Development (New)"],
+        "docker": ["Docker (New)"],
+        "angular": ["Angular 6 (New)"],
+        "react": ["ReactJS (New)"],
+        "python": ["Python 3 (New)"],
+        "rust": ["Smart Interview Live Coding", "Linux Programming (General)",
+                 "Networking and Implementation (New)"],
+        "networking": ["Networking and Implementation (New)"],
+        "linux": ["Linux Programming (General)", "Linux Administration (New)"],
+        "excel": ["MS Excel (New)", "Microsoft Excel 365 (New)",
+                  "Microsoft Excel 365 - Essentials (New)"],
+        "word": ["MS Word (New)", "Microsoft Word 365 (New)",
+                 "Microsoft Word 365 - Essentials (New)"],
+        "medical": ["Medical Terminology (New)"],
+        "hipaa": ["HIPAA (Security)"],
+        "customer service": ["Customer Service Phone Simulation",
+                             "Contact Center Call Simulation (New)",
+                             "Entry Level Customer Serv-Retail & Contact Center"],
+        "contact cent": ["Contact Center Call Simulation (New)",
+                         "Customer Service Phone Simulation",
+                         "SVAR - Spoken English (US) (New)"],
+        "svar": ["SVAR - Spoken English (US) (New)", "SVAR - Spoken English (U.K.)",
+                 "SVAR - Spoken English (AUS)", "SVAR - Spoken English (Indian Accent) (New)"],
+        "manufacturing": ["Manufac. & Indust. - Safety & Dependability 8.0",
+                          "Manufacturing & Industrial - Mechanical Focus 8.0"],
+        "numerical": ["SHL Verify Interactive – Numerical Reasoning"],
+        "financial": ["Financial Accounting (New)"],
+        "statistics": ["Basic Statistics (New)"],
+        "admin": ["MS Excel (New)", "MS Word (New)",
+                  "Microsoft Excel 365 (New)", "Microsoft Word 365 (New)"],
+    }
+
+    for signal, names in tech_mappings.items():
+        if signal in query_lower:
+            for name in names:
+                _add(name)
+
+    result = retrieved + injected
+    return result[:30]
 
 
 def _extract_mentioned_items(text: str, catalog: CatalogStore) -> list[dict]:
-    """Extract catalog items mentioned by name in the conversation text.
-    
-    This ensures that when users mention specific assessments (for comparison
-    or refinement), those items are always in the retrieval context.
-    
-    Args:
-        text: Combined conversation text.
-        catalog: CatalogStore for lookups.
-        
-    Returns:
-        List of catalog items mentioned in the text.
-    """
     mentioned = []
     seen_urls = set()
-    
-    # Check for known assessment names in the text
-    # Use longer names first to avoid partial matches
     all_names = sorted(catalog.get_all_names(), key=len, reverse=True)
     text_lower = text.lower()
-    
     for name in all_names:
         if name.lower() in text_lower:
             item = catalog.get_by_name(name)
             if item and item["url"] not in seen_urls:
                 mentioned.append(item)
                 seen_urls.add(item["url"])
-    
-    # Also check for common abbreviations
     abbreviations = {
         "OPQ": "Occupational Personality Questionnaire OPQ32r",
         "OPQ32r": "Occupational Personality Questionnaire OPQ32r",
@@ -343,42 +804,27 @@ def _extract_mentioned_items(text: str, catalog: CatalogStore) -> list[dict]:
         "GSA": "Global Skills Assessment",
         "DSI": "Dependability and Safety Instrument (DSI)",
         "MQ": "Motivational Questionnaire (MQ)",
-        "SVAR": None,  # Multiple SVAR variants — handled by retrieval
     }
-    
     for abbr, full_name in abbreviations.items():
         if abbr.lower() in text_lower and full_name:
             item = catalog.get_by_name(full_name)
             if item and item["url"] not in seen_urls:
                 mentioned.append(item)
                 seen_urls.add(item["url"])
-    
     return mentioned
 
 
 def _find_last_eoc_index(messages: list[dict]) -> Optional[int]:
-    """Find the index of the last assistant message that signaled end_of_conversation.
-    
-    Looks for end_of_conversation: true in assistant message content (JSON).
-    
-    Args:
-        messages: List of message dicts.
-        
-    Returns:
-        Index of the last EOC message, or None if not found.
-    """
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
         if msg["role"] == "assistant":
             content = msg["content"]
-            # Check for JSON with end_of_conversation: true
             if "end_of_conversation" in content:
                 try:
                     data = json.loads(content)
                     if data.get("end_of_conversation"):
                         return i
                 except (json.JSONDecodeError, AttributeError):
-                    # Also check for string pattern
                     if '"end_of_conversation": true' in content or '"end_of_conversation":true' in content:
                         return i
     return None

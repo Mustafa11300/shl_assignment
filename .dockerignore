@@ -1,0 +1,7 @@
+.env
+venv/
+__pycache__/
+*.pyc
+.git/
+.gemini/
+eval/eval_results.json

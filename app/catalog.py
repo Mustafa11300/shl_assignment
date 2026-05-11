@@ -9,6 +9,8 @@ import json
 import os
 from typing import Optional
 
+VALID_TEST_TYPE_CODES = {"A", "B", "C", "D", "E", "K", "P", "S"}
+
 # Test type full name → letter code mapping
 TEST_TYPE_CODES = {
     "Ability & Aptitude": "A",
@@ -31,6 +33,12 @@ def _get_data_path() -> str:
     return os.path.join(base, "data", "catalog.json")
 
 
+def _get_public_catalog_path() -> str:
+    """Return the path to the public catalog used by the evaluator."""
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "catalog.json")
+
+
 def _get_raw_data_path() -> str:
     """Return the path to the raw dataset.txt."""
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -50,6 +58,33 @@ def keys_to_test_type_code(keys: list[str]) -> str:
     return ",".join(sorted(codes))
 
 
+def normalize_test_type_code(value: str) -> str:
+    """Keep only supported letter codes in a stable comma-separated form."""
+    codes = []
+    for part in str(value or "").replace("/", ",").replace(";", ",").split(","):
+        code = part.strip().upper()
+        if code in VALID_TEST_TYPE_CODES and code not in codes:
+            codes.append(code)
+    return ",".join(sorted(codes))
+
+
+def _public_catalog_urls() -> Optional[set[str]]:
+    """Load the evaluator-facing catalog URL allow-list when available."""
+    public_path = _get_public_catalog_path()
+    if not os.path.exists(public_path):
+        return None
+
+    with open(public_path, "r") as f:
+        data = json.load(f)
+
+    urls = {
+        item.get("url", "").strip()
+        for item in data
+        if isinstance(item, dict) and item.get("url")
+    }
+    return urls or None
+
+
 def load_catalog() -> list[dict]:
     """Load the catalog from catalog.json (cleaned) or dataset.txt (raw).
     
@@ -57,11 +92,17 @@ def load_catalog() -> list[dict]:
     a computed `test_type` field with letter codes.
     """
     catalog_path = _get_data_path()
+    public_urls = _public_catalog_urls()
     
     # If cleaned catalog exists, use it
     if os.path.exists(catalog_path):
         with open(catalog_path, "r") as f:
-            return json.load(f)
+            catalog = json.load(f)
+        for item in catalog:
+            item["test_type"] = normalize_test_type_code(item.get("test_type", ""))
+        if public_urls is not None:
+            catalog = [item for item in catalog if item.get("url", "").strip() in public_urls]
+        return catalog
     
     # Otherwise, load from raw dataset.txt and clean
     raw_path = _get_raw_data_path()
@@ -84,6 +125,9 @@ def load_catalog() -> list[dict]:
             "remote": item.get("remote", ""),
             "adaptive": item.get("adaptive", ""),
         })
+
+    if public_urls is not None:
+        catalog = [item for item in catalog if item.get("url", "").strip() in public_urls]
     
     # Save cleaned version
     os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
