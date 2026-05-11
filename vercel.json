@@ -1,12 +1,15 @@
 {
   "version": 2,
-  "buildCommand": "echo 'Serving static HTML'",
-  "outputDirectory": ".",
   "public": true,
-  "rewrites": [
+  "buildCommand": "echo 'Static site'",
+  "outputDirectory": "public",
+  "env": {
+    "SKIP_ENV_VALIDATION": "1"
+  },
+  "routes": [
     {
-      "source": "/(.*)",
-      "destination": "/index.html"
+      "src": "/.*",
+      "dest": "/index.html"
     }
   ]
 }
