@@ -6,6 +6,14 @@ services:
     healthCheckPath: /health
     envVars:
       - key: USE_LLM
-        value: "false"
+        value: "true"
       - key: PORT
         value: 8000
+      - key: OPENROUTER_MODEL
+        value: "meta-llama/llama-4-scout"
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false

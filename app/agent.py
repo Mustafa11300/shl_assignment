@@ -204,6 +204,50 @@ def _has_enough_context(combined_text: str) -> bool:
 # LLM callers
 # ---------------------------------------------------------------------------
 
+def _call_openrouter(prompt_messages: list[dict]) -> str:
+    """Call OpenRouter using its OpenAI-compatible chat completions endpoint."""
+    import urllib.request
+    import urllib.error
+
+    or_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not or_key:
+        raise ValueError("OPENROUTER_API_KEY not set")
+
+    model = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-4-scout")
+    messages = [{"role": m["role"], "content": m["content"]} for m in prompt_messages]
+
+    # Google models on OpenRouter require max_completion_tokens, not max_tokens.
+    # Other models accept both; sending max_completion_tokens is universally safe.
+    payload = json.dumps({
+        "model": model,
+        "messages": messages,
+        "temperature": 0.3,
+        "max_completion_tokens": 2048,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {or_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/Mustafa11300/shl_assignment",
+            "X-Title": "SHL Assessment Recommender",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenRouter HTTP {e.code}: {body[:300]}") from e
+
+    content = (data["choices"][0]["message"].get("content") or "").strip()
+    if not content:
+        raise RuntimeError("OpenRouter returned empty content")
+    return content
+
+
 def _call_groq(prompt_messages: list[dict]) -> str:
     groq_key = os.environ.get("GROQ_API_KEY", "")
     if not groq_key:
@@ -212,10 +256,16 @@ def _call_groq(prompt_messages: list[dict]) -> str:
     client = Groq(api_key=groq_key)
     model = os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
     messages = [{"role": m["role"], "content": m["content"]} for m in prompt_messages]
-    response = client.chat.completions.create(
-        model=model, messages=messages, temperature=0.3, max_tokens=2048,
-    )
-    return response.choices[0].message.content
+    try:
+        response = client.chat.completions.create(
+            model=model, messages=messages, temperature=0.3, max_tokens=2048,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Groq API error: {str(e)[:200]}") from e
+    content = (response.choices[0].message.content or "").strip()
+    if not content:
+        raise RuntimeError("Groq returned empty content")
+    return content
 
 
 def _try_gemini_once(api_key: str, prompt_messages: list[dict]) -> Optional[str]:
@@ -246,7 +296,16 @@ def _try_gemini_once(api_key: str, prompt_messages: list[dict]) -> Optional[str]
 
 
 def _call_llm(prompt_messages: list[dict]) -> str:
-    """Gemini → Groq → wait 30s → Gemini. Each provider gets one shot."""
+    """OpenRouter → Gemini → Groq → wait 30s → Gemini. Each provider gets one shot."""
+    or_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if or_key:
+        try:
+            result = _call_openrouter(prompt_messages)
+            if result:
+                return result
+        except Exception as e:
+            logger.warning(f"OpenRouter failed: {str(e)[:120]}")
+
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     if gemini_key:
         result = _try_gemini_once(gemini_key, prompt_messages)
@@ -261,7 +320,7 @@ def _call_llm(prompt_messages: list[dict]) -> str:
             logger.warning(f"Groq failed: {str(e)[:100]}")
 
     if gemini_key:
-        logger.warning("Both providers failed. Waiting 30s...")
+        logger.warning("All providers failed. Waiting 30s before Gemini retry...")
         time.sleep(30)
         result = _try_gemini_once(gemini_key, prompt_messages)
         if result:
