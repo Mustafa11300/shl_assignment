@@ -31,6 +31,50 @@ _retriever: Optional[Any] = None
 
 MAX_TURNS = 8
 
+CATALOG_URL_RE = re.compile(r"https?://[^\s<>()\"']+", re.IGNORECASE)
+
+TYPE_NAME_TO_CODE = {
+    "ability": "A",
+    "aptitude": "A",
+    "cognitive": "A",
+    "reasoning": "A",
+    "biodata": "B",
+    "situational": "B",
+    "situational judgement": "B",
+    "situational judgment": "B",
+    "competencies": "C",
+    "competency": "C",
+    "development": "D",
+    "360": "D",
+    "assessment exercises": "E",
+    "assessment exercise": "E",
+    "type e": "E",
+    "knowledge": "K",
+    "skills": "K",
+    "simulation": "S",
+    "simulations": "S",
+    "personality": "P",
+    "behavior": "P",
+    "behaviour": "P",
+}
+
+JOB_LEVEL_ALIASES = {
+    "director": "Director",
+    "director-level": "Director",
+    "executive": "Executive",
+    "cxo": "Executive",
+    "entry-level": "Entry-Level",
+    "entry level": "Entry-Level",
+    "graduate": "Graduate",
+    "manager": "Manager",
+    "front line manager": "Front Line Manager",
+    "front-line manager": "Front Line Manager",
+    "supervisor": "Supervisor",
+    "mid-professional": "Mid-Professional",
+    "mid professional": "Mid-Professional",
+    "professional individual contributor": "Professional Individual Contributor",
+}
+
 CANONICAL_ASSESSMENTS = {
     "personality": "Occupational Personality Questionnaire OPQ32r",
     "cognitive": "SHL Verify Interactive G+",
@@ -359,8 +403,13 @@ def _parse_llm_response(raw_response: str, catalog: CatalogStore) -> ChatRespons
         name = rec.get("name", "")
         url = rec.get("url", "")
         catalog_item = None
-        if url and catalog.url_exists(url):
-            catalog_item = catalog.get_by_url(url)
+        if url:
+            if _is_safe_catalog_url(url, catalog):
+                catalog_item = catalog.get_by_url(url)
+            else:
+                # If the model emitted a URL, it must be a verbatim catalog URL.
+                # Do not salvage by name; that would let hallucinated URLs pass.
+                continue
         elif name:
             catalog_item = catalog.get_by_name(name)
             if not catalog_item:
@@ -384,9 +433,9 @@ def _parse_llm_response(raw_response: str, catalog: CatalogStore) -> ChatRespons
     ]
 
     return ChatResponse(
-        reply=data.get("reply", "Here are my recommendations."),
+        reply=data.get("reply", "Here are my recommendations.") if isinstance(data.get("reply"), str) else "Here are my recommendations.",
         recommendations=recs,
-        end_of_conversation=data.get("end_of_conversation", False),
+        end_of_conversation=bool(data.get("end_of_conversation", False)) and bool(recs),
     )
 
 
@@ -403,9 +452,14 @@ def _merge_recommendations(
         url = item.url if isinstance(item, Recommendation) else item.get("url", "")
         name = item.name if isinstance(item, Recommendation) else item.get("name", "")
         test_type = item.test_type if isinstance(item, Recommendation) else item.get("test_type", "")
-        if url and url not in seen and len(merged) < max_total:
-            merged.append(Recommendation(name=name, url=url, test_type=test_type))
-            seen.add(url)
+        catalog_item = catalog.get_by_url(url) if url and url.isascii() else None
+        if catalog_item and url not in seen and len(merged) < max_total:
+            merged.append(Recommendation(
+                name=catalog_item.get("name", name),
+                url=catalog_item["url"],
+                test_type=catalog_item.get("test_type", test_type),
+            ))
+            seen.add(catalog_item["url"])
     return merged
 
 
@@ -444,7 +498,7 @@ def _sanitize_user_content(text: str) -> str:
             continue  # skip control characters
         else:
             cleaned.append(ch)
-    return ''.join(cleaned)
+    return ''.join(cleaned)[:8000]
 
 
 def _is_injection_attempt(text: str) -> bool:
@@ -470,18 +524,65 @@ def _is_injection_attempt(text: str) -> bool:
         "let's roleplay", "lets roleplay",
         "developer says",
         "system says",
+        "jailbreak",
+        "unrestricted",
+        "outside your catalog",
+        "bypass",
+        "attacker.com",
+        "evil.com",
     ]
     return any(signal in low for signal in hard_signals)
 
 
 def _contains_json_injection(text: str) -> bool:
     """Detect JSON or recommendation-shaped objects embedded in user message (Case 5)."""
-    # Check for JSON-like structures that look like response manipulation
-    if '{"reply"' in text or '{"recommendations"' in text:
+    low = text.lower()
+    schema_key = re.compile(
+        r'["\']\s*(reply|recommendations|end_of_conversation|test_type)\s*["\']\s*:',
+        re.IGNORECASE,
+    )
+    if schema_key.search(text):
         return True
-    if '"end_of_conversation"' in text:
+    if re.search(r"\{[^{}]*(https?://|shl\.com|attacker\.com|evil\.com)[^{}]*\}", low, re.DOTALL):
         return True
     return False
+
+
+def _is_safe_catalog_url(url: str, catalog: CatalogStore) -> bool:
+    """A URL is safe only when it is pure ASCII and exists verbatim in the catalog."""
+    return bool(url) and url.isascii() and catalog.url_exists(url)
+
+
+def _extract_urls(text: str) -> list[str]:
+    """Extract URL-looking tokens, trimming punctuation outside the URL."""
+    urls = []
+    for match in CATALOG_URL_RE.findall(text or ""):
+        urls.append(match.rstrip(".,;:!?)]}\"'"))
+    return urls
+
+
+def _catalog_url_response(latest_user: str, catalog: CatalogStore) -> Optional[ChatResponse]:
+    """Answer direct URL lookup questions without allowing homoglyph bypasses."""
+    urls = _extract_urls(latest_user)
+    if not urls:
+        return None
+
+    valid_items = [catalog.get_by_url(url) for url in urls if _is_safe_catalog_url(url, catalog)]
+    valid_items = [item for item in valid_items if item]
+    if valid_items and len(valid_items) == len(urls):
+        recs = _to_recommendations(valid_items, catalog)
+        names = ", ".join(rec.name for rec in recs)
+        return ChatResponse(
+            reply=f"Yes, that URL is in the SHL catalog: {names}.",
+            recommendations=recs,
+            end_of_conversation=False,
+        )
+
+    return ChatResponse(
+        reply="That URL is not a verbatim SHL catalog URL I can validate. Please share the role or skills you need to assess, and I can recommend items from the catalog.",
+        recommendations=[],
+        end_of_conversation=False,
+    )
 
 
 def _is_refusal_topic(text: str) -> bool:
@@ -512,6 +613,262 @@ def _is_vague_request(text: str, has_context: bool, has_recs: bool) -> bool:
     if has_context or has_recs:
         return False
     return len(low.split()) < 5
+
+
+def _unsupported_tech_terms(text: str) -> set[str]:
+    low = text.lower()
+    terms = set()
+    if re.search(r"\brust\b", low):
+        terms.add("Rust")
+    if re.search(r"\b(wasm|webassembly)\b", low):
+        terms.add("WebAssembly")
+    if re.search(r"\bkotlin\b", low):
+        terms.add("Kotlin")
+    if re.search(r"\bgolang\b|\bgo\s+(developer|engineer|programmer)\b", low):
+        terms.add("Go")
+    return terms
+
+
+def _explicitly_disallows_adjacent(text: str) -> bool:
+    low = text.lower()
+    signals = [
+        "no proxies",
+        "without proxies",
+        "no proxy",
+        "specific only",
+        "wasm-specific",
+        "webassembly-specific",
+        "rust-specific",
+        "exact match only",
+        "nothing adjacent",
+    ]
+    return any(signal in low for signal in signals)
+
+
+def _has_prior_no_coverage_offer(messages: list[dict]) -> bool:
+    for msg in messages:
+        if msg["role"] != "assistant":
+            continue
+        low = msg["content"].lower()
+        if "catalog doesn't currently include" in low or "catalog does not currently include" in low:
+            return True
+        if "no rust-specific" in low or "no webassembly-specific" in low or "no wasm-specific" in low:
+            return True
+    return False
+
+
+def _no_coverage_response(terms: set[str], disallows_adjacent: bool) -> ChatResponse:
+    label = " or ".join(sorted(terms)) if terms else "that technology"
+    if disallows_adjacent:
+        reply = (
+            f"The catalog does not currently include a {label}-specific assessment, "
+            "and your constraints rule out adjacent proxies. I won't invent a catalog item; "
+            "if you relax the proxy constraint, I can suggest nearby SHL options."
+        )
+    else:
+        reply = (
+            f"The catalog doesn't currently include a {label}-specific assessment. "
+            "The closest SHL options are live coding, systems/Linux, networking, Verify G+, "
+            "and OPQ32r if you are open to adjacent signals."
+        )
+    return ChatResponse(reply=reply, recommendations=[], end_of_conversation=False)
+
+
+def _has_hard_constraint_language(text: str) -> bool:
+    low = text.lower()
+    signals = [
+        " only", "nothing else", "must ", "must have", "required",
+        "under ", "less than", "no cognitive", "without cognitive",
+        "in swahili", "adaptive", "remote",
+    ]
+    return any(signal in low for signal in signals)
+
+
+def _extract_required_types(text: str) -> set[str]:
+    low = text.lower()
+    required: set[str] = set()
+
+    if re.search(r"\btype\s*([abcdekps])\b", low):
+        for code in re.findall(r"\btype\s*([abcdekps])\b", low):
+            required.add(code.upper())
+
+    for label, code in TYPE_NAME_TO_CODE.items():
+        if label in low:
+            required.add(code)
+
+    return required
+
+
+def _extract_job_level(text: str) -> Optional[str]:
+    low = text.lower()
+    for signal, canonical in JOB_LEVEL_ALIASES.items():
+        if signal in low:
+            return canonical
+    return None
+
+
+def _extract_language(text: str) -> Optional[str]:
+    low = text.lower()
+    match = re.search(r"\b(?:in|only in)\s+([a-z][a-z -]+?)(?:,|\.|\s+under|\s+for|\s+with|\s+and|$)", low)
+    if not match:
+        return None
+    language = match.group(1).strip()
+    if language in {"the catalog", "your catalog", "this catalog", "a single assessment"}:
+        return None
+    return language.title()
+
+
+def _extract_max_duration(text: str) -> tuple[Optional[int], bool]:
+    low = text.lower()
+    match = re.search(r"\b(under|less than|at most|no more than|within)\s+(\d+)\s*(?:min|minute|minutes)\b", low)
+    if not match:
+        return None, False
+    strict = match.group(1) in {"under", "less than"}
+    return int(match.group(2)), strict
+
+
+def _constraints_from_text(text: str) -> dict:
+    low = text.lower()
+    required_types = _extract_required_types(text) if _has_hard_constraint_language(text) else set()
+    excluded_types: set[str] = set()
+    if "no cognitive" in low or "without cognitive" in low:
+        excluded_types.add("A")
+    required_types -= excluded_types
+
+    max_duration, duration_strict = _extract_max_duration(text)
+    language = _extract_language(text)
+
+    constraints = {
+        "required_types": required_types,
+        "excluded_types": excluded_types,
+        "single_assessment_all_types": "single assessment" in low and len(required_types) > 1,
+        "language": language,
+        "max_duration": max_duration,
+        "duration_strict": duration_strict,
+        "remote": True if re.search(r"\bremote\b", low) else None,
+        "adaptive": True if re.search(r"\badaptive\b", low) else None,
+        "job_level": _extract_job_level(text),
+    }
+    return constraints
+
+
+def _constraints_active(constraints: dict) -> bool:
+    return any([
+        constraints.get("required_types"),
+        constraints.get("excluded_types"),
+        constraints.get("language"),
+        constraints.get("max_duration") is not None,
+        constraints.get("remote") is not None,
+        constraints.get("adaptive") is not None,
+        constraints.get("single_assessment_all_types"),
+    ])
+
+
+def _item_codes(item: dict) -> set[str]:
+    return {code.strip() for code in item.get("test_type", "").split(",") if code.strip()}
+
+
+def _duration_minutes(item: dict) -> Optional[int]:
+    match = re.search(r"\d+", str(item.get("duration", "")))
+    return int(match.group(0)) if match else None
+
+
+def _language_matches(item: dict, language: str) -> bool:
+    languages = item.get("languages") or []
+    if not languages:
+        return False
+    wanted = language.lower()
+    return any(wanted in str(lang).lower() for lang in languages)
+
+
+def _item_matches_constraints(item: dict, constraints: dict) -> bool:
+    codes = _item_codes(item)
+    required = constraints.get("required_types") or set()
+    excluded = constraints.get("excluded_types") or set()
+
+    if required:
+        if constraints.get("single_assessment_all_types"):
+            if not required <= codes:
+                return False
+        elif not (required & codes):
+            return False
+
+    if excluded & codes:
+        return False
+
+    language = constraints.get("language")
+    if language and not _language_matches(item, language):
+        return False
+
+    max_duration = constraints.get("max_duration")
+    if max_duration is not None:
+        duration = _duration_minutes(item)
+        if duration is None:
+            return False
+        if constraints.get("duration_strict"):
+            if not duration < max_duration:
+                return False
+        elif duration > max_duration:
+            return False
+
+    if constraints.get("remote") is True and str(item.get("remote", "")).lower() != "yes":
+        return False
+
+    if constraints.get("adaptive") is True and str(item.get("adaptive", "")).lower() != "yes":
+        return False
+
+    job_level = constraints.get("job_level")
+    if job_level:
+        levels = item.get("job_levels") or []
+        if levels and job_level not in levels:
+            return False
+
+    return True
+
+
+def _filter_by_constraints(items: list[dict], constraints: dict) -> list[dict]:
+    if not _constraints_active(constraints):
+        return items
+    return [item for item in items if _item_matches_constraints(item, constraints)]
+
+
+def _constraint_catalog_candidates(catalog: CatalogStore, constraints: dict) -> list[dict]:
+    candidates = _filter_by_constraints(catalog.items, constraints)
+    candidates.sort(key=lambda item: (
+        0 if item.get("test_type") == "E" else 1,
+        item.get("name", ""),
+    ))
+    return candidates[:10]
+
+
+def _constraint_failure_reply(constraints: dict) -> str:
+    reasons = []
+    if constraints.get("language"):
+        reasons.append(f"language={constraints['language']}")
+    if constraints.get("max_duration") is not None:
+        op = "under" if constraints.get("duration_strict") else "within"
+        reasons.append(f"{op} {constraints['max_duration']} minutes")
+    if constraints.get("adaptive"):
+        reasons.append("adaptive=yes")
+    if constraints.get("remote"):
+        reasons.append("remote=yes")
+    if constraints.get("required_types"):
+        reasons.append("test_type=" + ",".join(sorted(constraints["required_types"])))
+    if constraints.get("excluded_types"):
+        reasons.append("excluded_type=" + ",".join(sorted(constraints["excluded_types"])))
+
+    detail = "; ".join(reasons) if reasons else "the requested hard constraints"
+    return (
+        "I could not verify any catalog assessment that satisfies all of those hard "
+        f"constraints ({detail}). I won't recommend partial matches unless you relax one."
+    )
+
+
+def _constraint_success_reply(recs: list[Recommendation], constraints: dict) -> str:
+    names = ", ".join(rec.name for rec in recs)
+    if constraints.get("required_types") == {"E"}:
+        return f"I found the catalog items that include Assessment Exercises (type E): {names}."
+    return f"I found catalog items that satisfy the hard constraints: {names}."
 
 
 def _apply_user_constraints(items: list[dict], latest_user: str) -> list[dict]:
@@ -554,8 +911,14 @@ def _to_recommendations(items: list[dict], catalog: CatalogStore) -> list[Recomm
     return recs
 
 
-def _build_rule_reply(latest_user: str, recs: list[Recommendation], refusing: bool = False) -> str:
+def _build_rule_reply(
+    latest_user: str,
+    recs: list[Recommendation],
+    refusing: bool = False,
+    confirming: Optional[bool] = None,
+) -> str:
     low = latest_user.lower()
+    is_confirming = _is_confirmation(latest_user) if confirming is None else confirming
     if refusing:
         return (
             "I can't advise on legal or regulatory obligations. I can help select "
@@ -591,8 +954,14 @@ def _build_rule_reply(latest_user: str, recs: list[Recommendation], refusing: bo
             "signal for senior design judgment. I would keep it if candidate time allows."
         )
 
+    if not recs:
+        return (
+            "I couldn't find a catalog-backed shortlist that matches those constraints. "
+            "Could you relax one requirement or share the role and skills you want to prioritize?"
+        )
+
     names = ", ".join(rec.name for rec in recs)
-    if _is_confirmation(latest_user):
+    if is_confirming:
         return f"Confirmed. Final shortlist: {names}."
     return f"Based on your requirements, I recommend this SHL shortlist: {names}."
 
@@ -602,13 +971,15 @@ def _deterministic_response(
     latest_user: str,
     catalog: CatalogStore,
     turns_remaining: int,
+    can_confirm: bool = True,
 ) -> ChatResponse:
     constrained = _apply_user_constraints(items, latest_user)
     recs = _to_recommendations(constrained, catalog)
+    is_confirming = can_confirm and _is_confirmation(latest_user)
     return ChatResponse(
-        reply=_build_rule_reply(latest_user, recs),
+        reply=_build_rule_reply(latest_user, recs, confirming=is_confirming),
         recommendations=recs,
-        end_of_conversation=turns_remaining <= 1 or _is_confirmation(latest_user),
+        end_of_conversation=bool(recs) and (turns_remaining <= 1 or is_confirming),
     )
 
 
@@ -647,7 +1018,31 @@ def _lexical_catalog_recommend(query: str, all_text: str, catalog: CatalogStore)
     return [item for _, item in scored[:10]]
 
 
-def _has_prior_recommendations(messages: list[dict]) -> bool:
+def _assistant_text_looks_like_our_shortlist(content: str) -> bool:
+    low = content.lower()
+    trusted_prefixes = [
+        "based on your requirements, i recommend this shl shortlist:",
+        "confirmed. final shortlist:",
+        "i found catalog items that satisfy the hard constraints:",
+        "i found the catalog items that include assessment exercises",
+    ]
+    return any(low.startswith(prefix) for prefix in trusted_prefixes)
+
+
+def _catalog_items_from_trusted_assistant_text(content: str, catalog: CatalogStore) -> list[Recommendation]:
+    if not _assistant_text_looks_like_our_shortlist(content):
+        return []
+    recs = []
+    seen = set()
+    for item in catalog.items:
+        name = item.get("name", "")
+        if name and name in content and item.get("url") not in seen:
+            recs.append(Recommendation(name=item["name"], url=item["url"], test_type=item["test_type"]))
+            seen.add(item["url"])
+    return recs[:10]
+
+
+def _has_prior_recommendations(messages: list[dict], catalog: CatalogStore) -> bool:
     """Check if any prior assistant turn contained non-empty recommendations."""
     for msg in messages:
         if msg["role"] == "assistant":
@@ -657,7 +1052,8 @@ def _has_prior_recommendations(messages: list[dict]) -> bool:
                 if data.get("recommendations") and len(data["recommendations"]) > 0:
                     return True
             except (json.JSONDecodeError, AttributeError):
-                pass
+                if _catalog_items_from_trusted_assistant_text(content, catalog):
+                    return True
     return False
 
 
@@ -682,7 +1078,9 @@ def _extract_prior_recommendations(messages: list[dict], catalog: CatalogStore) 
                     if recs:
                         return recs
             except (json.JSONDecodeError, AttributeError):
-                pass
+                recs = _catalog_items_from_trusted_assistant_text(content, catalog)
+                if recs:
+                    return recs
     return []
 
 
@@ -736,6 +1134,8 @@ def process_chat(messages: list[Message]) -> ChatResponse:
     else:
         restart_msgs = None
 
+    full_msg_dicts = [m.copy() for m in msg_dicts]
+
     # Turn cap
     if len(msg_dicts) >= MAX_TURNS:
         msg_dicts = msg_dicts[-(MAX_TURNS - 1):]
@@ -747,16 +1147,17 @@ def process_chat(messages: list[Message]) -> ChatResponse:
     logger.info(f"Turns: {len(msg_dicts)} in context, {turns_remaining} remaining")
 
     # Build query + full text
-    query_msgs = restart_msgs if restart_msgs else msg_dicts
+    active_history = restart_msgs if restart_msgs else full_msg_dicts
+    query_msgs = active_history
     query = build_query_from_messages(query_msgs)
-    all_text = " ".join(m["content"] for m in msg_dicts)
+    all_text = " ".join(m["content"] for m in active_history)
     combined = query + " " + all_text
-    latest_user = _latest_user_text(msg_dicts)
+    latest_user = _latest_user_text(active_history)
 
     # ── Cases 4/5/6/11: Deterministic injection detection ──
     if _is_injection_attempt(latest_user):
         # Case 11: If prior recs exist and user tries impersonation, preserve them
-        prior_recs = _extract_prior_recommendations(msg_dicts, catalog)
+        prior_recs = _extract_prior_recommendations(active_history, catalog)
         if prior_recs:
             return ChatResponse(
                 reply="I can only recommend assessments based on the role requirements we discussed. Would you like to refine the current list or add complementary assessments?",
@@ -777,13 +1178,13 @@ def process_chat(messages: list[Message]) -> ChatResponse:
         if clean_part and len(clean_part) > 10:
             latest_user = clean_part
             # Update msg_dicts so downstream uses clean content
-            for msg in reversed(msg_dicts):
+            for msg in reversed(active_history):
                 if msg["role"] == "user":
                     msg["content"] = clean_part
                     break
             # Recompute
-            query = build_query_from_messages(msg_dicts)
-            all_text = " ".join(m["content"] for m in msg_dicts)
+            query = build_query_from_messages(active_history)
+            all_text = " ".join(m["content"] for m in active_history)
             combined = query + " " + all_text
         else:
             return ChatResponse(
@@ -792,11 +1193,16 @@ def process_chat(messages: list[Message]) -> ChatResponse:
                 end_of_conversation=False,
             )
 
+    url_response = _catalog_url_response(latest_user, catalog)
+    if url_response:
+        return url_response
+
     # ── Cases 7/8: Premature confirmation guard ──
-    has_prior_recs = _has_prior_recommendations(msg_dicts)
-    if _is_confirmation(latest_user) and not has_prior_recs:
+    has_prior_recs = _has_prior_recommendations(active_history, catalog)
+    has_prior_no_coverage_offer = _has_prior_no_coverage_offer(active_history)
+    if _is_confirmation(latest_user) and not has_prior_recs and not has_prior_no_coverage_offer:
         # Case 8: First message is confirmation with zero context
-        if len([m for m in msg_dicts if m["role"] == "user"]) <= 1:
+        if len([m for m in active_history if m["role"] == "user"]) <= 1:
             return ChatResponse(
                 reply="It looks like we haven't discussed any assessments yet. Could you tell me about the role you are hiring for so I can make some recommendations?",
                 recommendations=[],
@@ -808,6 +1214,16 @@ def process_chat(messages: list[Message]) -> ChatResponse:
             recommendations=[],
             end_of_conversation=False,
         )
+
+    user_text_all = " ".join(m["content"] for m in active_history if m["role"] == "user")
+    unsupported_terms = _unsupported_tech_terms(user_text_all)
+    disallows_adjacent = _explicitly_disallows_adjacent(user_text_all)
+    if unsupported_terms and (
+        disallows_adjacent
+        or not has_prior_no_coverage_offer
+        or not _is_confirmation(latest_user)
+    ):
+        return _no_coverage_response(unsupported_terms, disallows_adjacent)
 
     # ── Step 1: Rule-based recommendations (always computed) ──────────────
     rule_recs = _rule_based_recommend(query, all_text, catalog)
@@ -828,22 +1244,43 @@ def process_chat(messages: list[Message]) -> ChatResponse:
             end_of_conversation=False,
         )
 
-    # Avoid LLM calls by default so rate limits cannot produce empty or
-    # hallucinated recommendations. The LLM path remains available with USE_LLM=1.
-    if has_context and rule_recs and not _llm_enabled():
-        response = _deterministic_response(rule_recs, latest_user, catalog, turns_remaining)
+    constraints = _constraints_from_text(latest_user)
+    if _constraints_active(constraints):
+        constrained_rule_recs = _filter_by_constraints(rule_recs, constraints)
+        candidates = constrained_rule_recs or _constraint_catalog_candidates(catalog, constraints)
+        recs = _to_recommendations(candidates, catalog)
+        if not recs:
+            return ChatResponse(
+                reply=_constraint_failure_reply(constraints),
+                recommendations=[],
+                end_of_conversation=False,
+            )
+        return ChatResponse(
+            reply=_constraint_success_reply(recs, constraints),
+            recommendations=recs,
+            end_of_conversation=False,
+        )
+
+    # Prefer deterministic catalog-backed answers whenever rules cover the
+    # request. The LLM path remains only for uncovered fallbacks.
+    if has_context and rule_recs:
+        response = _deterministic_response(
+            rule_recs, latest_user, catalog, turns_remaining, can_confirm=has_prior_recs
+        )
         if response.recommendations:
             # Rule D: Never set end_of_conversation=true if no prior recs exist
-            if response.end_of_conversation and not has_prior_recs and not _is_confirmation(latest_user):
+            if response.end_of_conversation and not has_prior_recs:
                 response.end_of_conversation = False
             return response
 
-    if has_context and not _llm_enabled():
+    if has_context:
         lexical = _lexical_catalog_recommend(query, all_text, catalog)
         lexical = _inject_canonical_assessments(combined, lexical, catalog)
-        response = _deterministic_response(lexical, latest_user, catalog, turns_remaining)
+        response = _deterministic_response(
+            lexical, latest_user, catalog, turns_remaining, can_confirm=has_prior_recs
+        )
         if response.recommendations:
-            if response.end_of_conversation and not has_prior_recs and not _is_confirmation(latest_user):
+            if response.end_of_conversation and not has_prior_recs:
                 response.end_of_conversation = False
             return response
 
@@ -895,9 +1332,9 @@ def process_chat(messages: list[Message]) -> ChatResponse:
             Recommendation(name=i["name"], url=i["url"], test_type=i["test_type"])
             for i in rule_recs[:10]
         ]
-        eoc = turns_remaining <= 0
+        eoc = bool(recs) and turns_remaining <= 0 and has_prior_recs
         return ChatResponse(
-            reply="Based on your requirements, here are the most relevant SHL assessments I recommend.",
+            reply=_build_rule_reply(latest_user, recs),
             recommendations=recs,
             end_of_conversation=eoc,
         )
@@ -925,13 +1362,14 @@ def process_chat(messages: list[Message]) -> ChatResponse:
 
     # Turn-cap enforcement
     if turns_remaining <= 1 and not llm_response.end_of_conversation:
-        llm_response.end_of_conversation = True
         if not llm_response.recommendations and has_context and rule_recs:
             llm_response.recommendations = [
                 Recommendation(name=i["name"], url=i["url"], test_type=i["test_type"])
                 for i in rule_recs[:10]
             ]
-        logger.warning("Forced end_of_conversation due to turn cap")
+        llm_response.end_of_conversation = bool(llm_response.recommendations) and has_prior_recs
+        if llm_response.end_of_conversation:
+            logger.warning("Forced end_of_conversation due to turn cap")
 
     return llm_response
 

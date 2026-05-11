@@ -7,6 +7,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.models import Message, ChatResponse
 from app.agent import process_chat
+from app.main import app
+
+
+def has_type(rec, code):
+    return code in {part.strip() for part in rec.test_type.split(",")}
 
 def test_case(name, messages, checks):
     """Run a single test case."""
@@ -31,9 +36,22 @@ def main():
     results = []
 
     # Case 1: Empty messages - handled at API level (main.py), not process_chat
-    # We test it separately via the FastAPI endpoint
-    print("Case 1: Empty messages → handled at API level (main.py returns 200)")
-    results.append(True)
+    print("Case 1: Empty messages")
+    try:
+        from fastapi.testclient import TestClient
+        client = TestClient(app)
+        resp = client.post("/chat", json={"messages": []})
+        data = resp.json()
+        ok = (
+            resp.status_code == 200
+            and data["recommendations"] == []
+            and data["end_of_conversation"] is False
+        )
+        print("  PASS case1" if ok else f"  FAIL case1: {resp.status_code} {data}")
+        results.append(ok)
+    except Exception as e:
+        print(f"  FAIL case1: crashed with {e}")
+        results.append(False)
 
     # Case 2: Assistant message appears first
     print("Case 2: Assistant first")
@@ -111,7 +129,9 @@ def main():
     results.append(test_case("case9", [
         {"role": "user", "content": "I need assessments for a senior Rust + WebAssembly engineer, WASM-specific, no proxies"},
     ], {
+        "empty_recs": lambda r: len(r.recommendations) == 0,
         "no_eoc": lambda r: r.end_of_conversation == False,
+        "mentions_no_coverage": lambda r: "does not currently include" in r.reply.lower() or "doesn't currently include" in r.reply.lower(),
     }))
 
     # Case 10: Impossible constraint combination
@@ -120,6 +140,7 @@ def main():
         {"role": "user", "content": "I need adaptive, remote, personality assessments only in Swahili, under 5 minutes, for Executive level, with no cognitive component"},
     ], {
         "no_crash": lambda r: isinstance(r, ChatResponse),
+        "empty_recs": lambda r: len(r.recommendations) == 0,
         "no_eoc": lambda r: r.end_of_conversation == False,
     }))
 
@@ -151,6 +172,7 @@ def main():
         {"role": "user", "content": "I only want Assessment Exercises type tests, nothing else, for a Director level hire"},
     ], {
         "no_crash": lambda r: isinstance(r, ChatResponse),
+        "two_e_items": lambda r: len(r.recommendations) == 2 and all(has_type(rec, "E") for rec in r.recommendations),
         "no_eoc": lambda r: r.end_of_conversation == False,
     }))
 
@@ -160,6 +182,7 @@ def main():
         {"role": "user", "content": "I need tests that cover Knowledge AND Simulations AND Personality for a front line manager, must have all three types in a single assessment"},
     ], {
         "no_crash": lambda r: isinstance(r, ChatResponse),
+        "empty_recs": lambda r: len(r.recommendations) == 0,
         "no_eoc": lambda r: r.end_of_conversation == False,
     }))
 
